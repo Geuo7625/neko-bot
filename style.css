@@ -1,0 +1,322 @@
+/* ======================================================== 
+   全局 
+   ======================================================== */
+* {
+  box-sizing: border-box;
+}
+@font-face {
+  font-family: "NekoCodeFont";
+  src: url("/assets/font.ttf") format("truetype");
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: block;
+}
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background: transparent;
+}
+body {
+  width: max-content;
+  min-width: 1600px;
+  font-family:
+    "NekoCodeFont",
+    -apple-system,
+    BlinkMacSystemFont,
+    "Segoe UI",
+    "PingFang SC",
+    "Microsoft YaHei",
+    sans-serif;
+  color: #20242a;
+}
+/* ======================================================== 
+   截图画布 
+   - 最低分辨率 1600 × 1200 (4:3)
+   - 宽度根据内容自适应收紧 (fit-content)
+   - 主背景色：极淡的 #95A966 柔绿调 (#F3F6ED)
+   ======================================================== */
+#capture {
+  position: relative;
+  display: block;
+  width: fit-content;
+  min-width: 1600px;
+  max-width: 2560px;
+  min-height: 1200px;
+  padding: 100px 120px;
+  height: auto;
+  overflow: hidden;
+  border-radius: 0;
+  isolation: isolate;
+  /* 
+   * 核心改良：使用多重平滑径向渐变代替孤立光晕，
+   * 零卡顿，且彻底消除四角“圆圈感”
+   */
+  background-color: #f8faf4;
+  background-image: 
+    /* 左上：稍深一点的苔绿融入 (透明度由 0.28 调至 0.16) */
+    radial-gradient(
+      ellipse 100% 80% at 0% 0%,
+      rgba(149, 169, 102, 0.16) 0%,
+      rgba(248, 250, 244, 0) 70%
+    ),
+    /* 右上：暖白高光提亮 (透明度由 0.8 调至 0.5) */
+    radial-gradient(
+        ellipse 90% 70% at 100% 0%,
+        rgba(255, 255, 255, 0.5) 0%,
+        rgba(248, 250, 244, 0) 65%
+      ),
+    /* 右下：温润杏黄色交融 (透明度由 0.25 调至 0.14) */
+    radial-gradient(
+        ellipse 110% 90% at 100% 100%,
+        rgba(226, 210, 141, 0.133) 0%,
+        rgba(248, 250, 244, 0) 70%
+      ),
+    /* 左下：柔和微蓝调过渡 (透明度由 0.2 调至 0.11) */
+    radial-gradient(
+        ellipse 90% 80% at 0% 100%,
+        rgba(175, 205, 225, 0.11) 0%,
+        rgba(248, 250, 244, 0) 60%
+      ),
+    /* 中央轻微柔白过渡 (透明度由 0.249 调至 0.15) */
+    radial-gradient(
+        ellipse 60% 50% at 50% 45%,
+        rgba(255, 255, 255, 0.15) 0%,
+        rgba(248, 250, 244, 0) 100%
+      );
+}
+/* 
+ * 微弱的辅助模糊层 (透明度由 0.15 调至 0.08)
+ */
+#capture::before {
+  content: "";
+  position: absolute;
+  inset: -100px;
+  pointer-events: none;
+  z-index: -1;
+  background: radial-gradient(
+    circle at 30% 20%,
+    rgba(193, 206, 159, 0.08),
+    transparent 60%
+  );
+  filter: blur(70px);
+}
+/* ======================================================== 
+   内容区域 
+   ======================================================== */
+#content {
+  position: relative;
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+  line-height: 1.8;
+  font-size: 44px;
+  font-weight: 400;
+  text-align: left;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  padding-bottom: 100px;
+}
+#content > :first-child {
+  margin-top: 0;
+}
+#content > :last-child {
+  margin-bottom: 0;
+}
+/* ======================================================== 
+   页脚区域 (SVG 猫爪 + 署名) 
+   ======================================================== */
+.footer {
+  position: absolute;
+  right: 80px;
+  bottom: 60px;
+  color: #2c4a3b49; /* 调微深了一些以契合绿底 */
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 16px;
+  z-index: 2;
+  pointer-events: none;
+}
+.cat-paw-svg {
+  padding-bottom: 6px;
+  width: 65px;
+  height: 65px;
+  opacity: 0.8;
+  transform: rotate(-12deg);
+  flex-shrink: 0;
+}
+.footer-text {
+  font-size: 36px;
+  letter-spacing: 1.2px;
+  opacity: 0.85;
+  white-space: nowrap;
+}
+/* ======================================================== 
+   Markdown 标题与正文 
+   ======================================================== */
+h1,
+h2,
+h3,
+h4,
+h5,
+h6 {
+  margin: 1.2em 0 0.55em;
+  line-height: 1.35;
+  text-align: left;
+}
+h1 {
+  font-size: 72px;
+}
+h2 {
+  font-size: 60px;
+}
+h3 {
+  font-size: 52px;
+}
+h4 {
+  font-size: 46px;
+}
+h5 {
+  font-size: 42px;
+}
+h6 {
+  font-size: 38px;
+}
+p {
+  margin: 0.7em 0;
+  text-align: left;
+}
+ul,
+ol {
+  margin: 0.7em 0;
+  padding-left: 1.8em;
+  text-align: left;
+}
+li {
+  margin: 0.3em 0;
+}
+blockquote {
+  margin: 1em 0;
+  padding: 0.6em 1.6em;
+  border-left: 10px solid #a3b875;
+  color: #4a5742;
+  background: rgba(255, 255, 255, 0.55);
+  border-radius: 0 20px 20px 0;
+}
+hr {
+  border: 0;
+  border-top: 4px solid rgba(149, 169, 102, 0.25);
+  margin: 1.5em 0;
+}
+a {
+  color: #0969da;
+  text-decoration: none;
+}
+strong {
+  font-weight: 700;
+}
+del {
+  opacity: 0.7;
+}
+/* ======================================================== 
+   行内代码 
+   ======================================================== */
+code {
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 0.88em;
+  padding: 0.2em 0.45em;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.65);
+}
+/* ======================================================== 
+   表格 
+   ======================================================== */
+table {
+  border-collapse: collapse;
+  margin: 1em 0;
+  width: max-content;
+  max-width: 100%;
+  font-size: 0.95em;
+}
+th,
+td {
+  padding: 20px 28px;
+  border: 2px solid #cbd5e1;
+}
+th {
+  background: rgba(255, 255, 255, 0.7);
+  font-weight: 700;
+}
+/* ======================================================== 
+   图片 
+   ======================================================== */
+img {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  margin: 32px 0;
+  border-radius: 24px;
+}
+/* ======================================================== 
+   KaTeX (公式居左) 
+   ======================================================== */
+.katex-display {
+  margin: 1.3em 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  text-align: left !important;
+}
+.katex-display > .katex {
+  text-align: left !important;
+  display: inline-block;
+}
+/* ======================================================== 
+   Mermaid 
+   ======================================================== */
+.mermaid-container {
+  display: flex;
+  justify-content: flex-start;
+  width: 100%;
+  max-width: 100%;
+  margin: 36px 0;
+  overflow-x: auto;
+}
+.mermaid {
+  display: block;
+}
+/* ======================================================== 
+   Markdown 代码块 
+   ======================================================== */
+pre {
+  overflow-x: auto;
+  padding: 34px 40px;
+  border-radius: 24px;
+  background: rgba(255, 255, 255, 0.65);
+  font-size: 38px;
+  line-height: 1.65;
+}
+pre code {
+  padding: 0;
+  background: transparent;
+}
+/* ============================================================
+   Full LaTeX
+   与 Markdown 共用 #capture / #content 布局
+   ============================================================ */
+.latex-render {
+  width: 100%;
+  box-sizing: border-box;
+  display: flex;
+  justify-content: flex-start;
+  align-items: flex-start;
+  overflow: hidden;
+}
+
+.latex-page {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  height: auto;
+  margin: 0;
+}

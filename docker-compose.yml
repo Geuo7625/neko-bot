@@ -1,0 +1,14 @@
+version: "3.8"
+services:
+  neko-bot:
+    build: .
+    container_name: neko_bot
+    restart: unless-stopped
+    network_mode: host
+    working_dir: /app
+    env_file:
+      - .env
+    volumes:
+      - ./:/app
+      - /app/node_modules
+    command: ["node", "--enable-source-maps", "/app/main.js"]

@@ -1,0 +1,318 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>NekoCode Renderer</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <div id="capture">
+      <div id="content"></div>
+      <div class="footer" aria-hidden="true">
+        <svg
+          class="cat-paw-svg"
+          version="1.1"
+          xmlns="http://www.w3.org/2000/svg"
+          viewBox="0 0 500.421 500.421"
+          xml:space="preserve"
+          fill="currentColor"
+        >
+          <path
+            d="M454.803,50.967L406.325,2.489c-3.319-3.319-8.701-3.319-12.021,0c-3.32,3.319-3.319,8.701,0,12.02l48.478,48.477
+	c16.955,16.955,16.955,44.543,0,61.499c-8.133,8.133-19.082,12.508-30.776,12.348c-11.711-0.171-22.73-4.833-31.025-13.128
+	L317.36,60.084c-23.583-23.584-61.903-23.637-85.42-0.12c-23.583,23.583-23.583,61.956,0,85.539l22.811,22.811
+	c-17.814-6.183-36.729-9.412-56.142-9.412c-45.611,0-88.493,17.762-120.745,50.015c-66.579,66.579-66.579,174.91,0,241.489
+	c32.252,32.252,75.133,50.014,120.745,50.014c45.611,0,88.493-17.762,120.745-50.014c32.252-32.252,50.014-75.133,50.014-120.745
+	c0-45.612-17.762-88.493-50.014-120.745c-0.758-0.758-1.528-1.501-2.298-2.243l-73.096-73.192
+	c-16.954-16.955-16.954-44.542,0-61.498c16.89-16.889,44.423-16.835,61.379,0.12l63.621,63.621
+	c11.44,11.44,26.639,17.87,42.798,18.105c16.323,0.225,31.634-5.914,43.044-17.325C478.386,112.923,478.386,74.55,454.803,50.967z
+	 M282.492,200.752c-20.549,1.744-40.558,6.11-59.625,12.961c-0.4-0.204-0.815-0.387-1.256-0.529
+	c-37.099-11.941-75.955-14.473-113.851-7.604c26.197-19.266,57.722-29.678,90.849-29.678
+	C228.852,175.903,257.755,184.585,282.492,200.752z M108.876,301.361c-20.993-0.654-41.937,1.504-62.403,6.444
+	c1.291-9.065,3.397-18.033,6.303-26.793c0.15-0.044,0.301-0.084,0.45-0.136c29.854-10.44,56.154-14.428,83.397-12.515
+	c-0.215,0.213-0.435,0.419-0.648,0.633C125.897,279.072,116.854,289.907,108.876,301.361z M153.547,253.075
+	c-0.021-0.003-0.041-0.009-0.061-0.012c-31.063-4.458-60.001-2.211-92.151,7.328c5.619-11.155,12.679-21.763,21.185-31.543
+	c36.247-10.54,77.873-12.494,115.29-4.432C182.139,232.218,167.298,241.802,153.547,253.075z M44.975,325.739
+	c17.419-4.681,35.243-7.181,53.164-7.465c-16.345,28.348-26.571,59.828-29.991,92.793C51.949,385.112,44.226,355.337,44.975,325.739
+	z M83.902,432.047c0.969-57.065,23.633-110.571,64.094-151.032c40.769-40.768,97.503-63.467,155.136-64.11
+	c1.419,1.318,2.824,2.656,4.201,4.033c5.856,5.856,11.171,12.107,15.942,18.683c-114.42,8.899-205.967,99.229-216.401,213.47
+	c-5.958-4.447-11.637-9.353-16.989-14.705C87.817,436.318,85.828,434.201,83.902,432.047z M344.588,281.129
+	c-51.441,6.717-96.881,27.751-131.855,61.152c-36.447,34.807-58.689,80.571-64.6,132.691c-8.64-2.994-16.994-6.753-24.973-11.26
+	c5.678-113.292,97.102-203.501,210.512-207.663C338.059,264.073,341.715,272.459,344.588,281.129z M340.248,389.684
+	c-12.939-28.395-31.462-54.023-54.293-75.177c11.354-4.877,23.316-8.863,35.807-11.882c11.766,14.99,21.513,31.491,29.034,49.118
+	C348.919,364.881,345.366,377.611,340.248,389.684z M351.791,316.34c-3.58-5.973-7.42-11.784-11.516-17.413
+	c2.9-0.461,5.827-0.865,8.775-1.225C350.337,303.818,351.254,310.039,351.791,316.34z M263.787,390.095
+	c14.795,16.293,27.086,34.799,36.422,54.97c-24.614,21.729-55.08,34.819-87.676,37.727
+	C217.298,444.266,236.016,410.34,263.787,390.095z M195.365,483.381c-10.425-0.214-20.679-1.455-30.643-3.685
+	c5.005-49.289,26.268-92.151,59.165-124.064c9.929,6.674,19.24,14.111,27.866,22.226
+	C220.685,401.488,200.05,440.063,195.365,483.381z M312.996,432.411c-17.504-35.382-43.581-65.728-76.011-88.408
+	c9.979-8.104,20.814-15.311,32.41-21.524c26.951,23.451,47.92,53.454,60.704,86.981C325.165,417.557,319.453,425.24,312.996,432.411
+	z"
+          />
+        </svg>
+        <span class="footer-text">@yuragi by Geuo</span>
+      </div>
+    </div>
+    <script>
+      let markdownRenderer = null;
+      function escapeHtml(value) {
+        return String(value)
+          .replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;")
+          .replace(/"/g, "&quot;")
+          .replace(/'/g, "&#039;");
+      }
+      window.initializeRenderer = function () {
+        if (typeof window.markdownit !== "function") {
+          throw new Error("markdown-it 未加载");
+        }
+        markdownRenderer = window.markdownit({
+          html: true,
+          breaks: true,
+          linkify: true,
+          typographer: true,
+          highlight: (str, lang) => {
+            if (window.hljs && lang && hljs.getLanguage(lang)) {
+              try {
+                return hljs.highlight(str, { language: lang }).value;
+              } catch {}
+            }
+            return "";
+          },
+        });
+        const defaultFence =
+          markdownRenderer.renderer.rules.fence ||
+          ((tokens, idx, options, env, self) =>
+            self.renderToken(tokens, idx, options));
+        markdownRenderer.renderer.rules.fence = (
+          tokens,
+          idx,
+          options,
+          env,
+          self,
+        ) => {
+          const token = tokens[idx];
+          const info = token.info
+            ? token.info.trim().split(/\s+/)[0].toLowerCase()
+            : "";
+          if (info === "mermaid") {
+            return `<div class="mermaid-container"><div class="mermaid">${escapeHtml(token.content)}</div></div>`;
+          }
+          return defaultFence(tokens, idx, options, env, self);
+        };
+        if (window.mermaid) {
+          window.mermaid.initialize({
+            startOnLoad: false,
+            securityLevel: "loose",
+            theme: "default",
+            flowchart: { useMaxWidth: false },
+            sequence: { useMaxWidth: false },
+            gantt: { useMaxWidth: false },
+          });
+        }
+      };
+      function renderKatex(source) {
+        if (
+          !window.katex ||
+          typeof window.katex.renderToString !== "function"
+        ) {
+          return source;
+        }
+        const placeholders = [];
+        let text = String(source || "").replace(/```[\s\S]*?```/g, (match) => {
+          const index = placeholders.length;
+          placeholders.push(match);
+          return `\u0000CODE_${index}\u0000`;
+        });
+        const render = (formula, display, raw) => {
+          try {
+            return window.katex.renderToString(formula.trim(), {
+              displayMode: display,
+              throwOnError: false,
+              strict: false,
+            });
+          } catch {
+            return raw;
+          }
+        };
+        text = text.replace(/\$\$([\s\S]*?)\$\$/g, (_, formula) =>
+          render(formula, true, _),
+        );
+        text = text.replace(/\\\[([\s\S]*?)\\\]/g, (_, formula) =>
+          render(formula, true, _),
+        );
+        text = text.replace(/\\\(([\s\S]*?)\\\)/g, (_, formula) =>
+          render(formula, false, _),
+        );
+        text = text.replace(
+          /(^|[^$])\$(?!\$)([^\n$]+?)\$(?!\$)/g,
+          (_, prefix, formula) => prefix + render(formula, false, _),
+        );
+        return text.replace(
+          /\u0000CODE_(\d+)\u0000/g,
+          (_, index) => placeholders[Number(index)],
+        );
+      }
+      window.renderMarkdown = async function (source) {
+        if (!markdownRenderer) window.initializeRenderer();
+        const content = document.getElementById("content");
+        if (!content) {
+          throw new Error("#content 不存在");
+        }
+        content.innerHTML = markdownRenderer.render(
+          renderKatex(String(source || "")),
+        );
+      };
+      window.renderMermaid = async function () {
+        if (!window.mermaid) return;
+        const nodes = document.querySelectorAll(".mermaid");
+        let counter = 0;
+        for (const node of nodes) {
+          if (node.dataset.rendered === "true") continue;
+          const source = node.textContent || "";
+          const id = `mermaid-${Date.now()}-${counter++}`;
+          try {
+            const result = await window.mermaid.render(id, source);
+            node.innerHTML = result.svg;
+            node.dataset.rendered = "true";
+            if (result.bindFunctions) {
+              result.bindFunctions(node);
+            }
+          } catch (error) {
+            console.error("Mermaid 渲染失败:", error);
+            node.textContent = source;
+            node.dataset.rendered = "error";
+          }
+        }
+      };
+    </script>
+    <script type="module">
+      window.pdfjsReady = (async () => {
+        const pdfjsLib = await import("/pdfjs/pdf.min.mjs");
+        window.pdfjsLib = pdfjsLib;
+        if (pdfjsLib.GlobalWorkerOptions) {
+          pdfjsLib.GlobalWorkerOptions.workerSrc = "/pdfjs/pdf.worker.min.mjs";
+        }
+        return pdfjsLib;
+      })();
+    </script>
+    <script type="module">
+      let busyTexRunner = null;
+      let xelatex = null;
+      let busyTexPromise = null;
+      function toBase64(bytes) {
+        const u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+        let binary = "";
+        const chunk = 0x8000;
+        for (let i = 0; i < u8.length; i += chunk) {
+          binary += String.fromCharCode(
+            ...u8.subarray(i, Math.min(i + chunk, u8.length)),
+          );
+        }
+        return btoa(binary);
+      }
+      async function ensureBusyTex() {
+        if (busyTexRunner && xelatex) return xelatex;
+        if (busyTexPromise) return busyTexPromise;
+        busyTexPromise = (async () => {
+          const cfg = window.__busyTexConfig || {};
+          if (!cfg.moduleUrl) {
+            throw new Error("缺少 BusyTeX moduleUrl");
+          }
+          if (!cfg.preloadDataPackages?.length) {
+            throw new Error(
+              "BusyTeX 未配置 texlive data package，请确认 texlive-basic.js 存在",
+            );
+          }
+          console.log("[LaTeX] 初始化 BusyTeX...");
+          const mod = await import(cfg.moduleUrl);
+          const runner = new mod.BusyTexRunner({
+            busytexBasePath: cfg.basePath || "/busytex",
+            preloadDataPackages: cfg.preloadDataPackages || [],
+            catalogDataPackages: cfg.catalogDataPackages || [],
+            verbose: true,
+            engineMode: "combined",
+            // 临时测试
+            remoteEndpoint: cfg.remoteEndpoint || undefined,
+          });
+          await runner.initialize(true);
+          busyTexRunner = runner;
+          xelatex = new mod.XeLatex(runner, true);
+          console.log("[LaTeX] XeLaTeX 已就绪");
+          return xelatex;
+        })();
+        try {
+          return await busyTexPromise;
+        } finally {
+          busyTexPromise = null;
+        }
+      }
+      async function loadBusyTexFile(name) {
+        const response = await fetch(`/busytex/${name}`);
+        if (!response.ok) {
+          throw new Error(`BusyTeX 文件加载失败: ${name} (${response.status})`);
+        }
+        return new Uint8Array(await response.arrayBuffer());
+      }
+      window.compileLatex = async function (source) {
+        const engine = await ensureBusyTex();
+        const cfg = window.__busyTexConfig || {};
+        const additionalFiles = [
+          {
+            path: "FandolSong-Regular.otf",
+            content: await loadBusyTexFile("FandolSong-Regular.otf"),
+          },
+          {
+            path: "FandolSong-Bold.otf",
+            content: await loadBusyTexFile("FandolSong-Bold.otf"),
+          },
+          {
+            path: "FandolHei-Regular.otf",
+            content: await loadBusyTexFile("FandolHei-Regular.otf"),
+          },
+          {
+            path: "FandolFang-Regular.otf",
+            content: await loadBusyTexFile("FandolFang-Regular.otf"),
+          },
+        ];
+        const result = await engine.compile({
+          input: String(source || ""),
+          mainTexPath: "main.tex",
+          additionalFiles,
+          rerun: true,
+          verbose: "silent",
+          remoteEndpoint: cfg.remoteEndpoint || undefined,
+        });
+        console.log("[LaTeX DEBUG] success =", result?.success);
+        console.log("[LaTeX DEBUG] exitCode =", result?.exitCode);
+        console.log("[LaTeX DEBUG] log =", result?.log);
+        const logs = result?.logs || [];
+        for (const item of logs) {
+          const text = [
+            item?.stdout,
+            item?.stderr,
+            item?.log,
+            item?.texmflog,
+            item?.missfontlog,
+          ]
+            .filter(Boolean)
+            .join("\n");
+          if (/font|Fandol|CJK|xeCJK|fatal|error|missing/i.test(text)) {
+            console.log("[LaTeX FONT/ERROR]", text);
+          }
+        }
+        if (result?.pdf) {
+          result.pdf = toBase64(result.pdf);
+        }
+        return result;
+      };
+      window.addEventListener("beforeunload", () => {
+        try {
+          busyTexRunner?.terminate();
+        } catch {}
+      });
+    </script>
+  </body>
+</html>
