@@ -83,6 +83,32 @@ function getRecentImageContext({ isGroup, groupId, userId, currentMessageId = nu
   return context;
 }
 
+function shouldUseRecentImageContext(text) {
+  const normalized = String(text || "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!normalized) return false;
+
+  // 明确视觉对象：只要当前消息点名图片/截图/照片/头像等，就允许取最近图片。
+  if (/这张|这幅|这图|这图片|刚才(?:那张|那个)?图|上一张|上面的图|截图|照片|图片|图像|插画|头像|壁纸|海报|配图/i.test(normalized)) {
+    return true;
+  }
+
+  // 没点名“图片”时，只接受“这个/它/刚才那个”这类承接式引用，
+  // 再叠加明显的视觉处理/评价动作；普通“分析一下”“怎么样”不会触发。
+  if (
+    /(?:这个|这个东西|它|刚才那个|刚刚那个|上一张)/i.test(normalized) &&
+    /(?:看看|看一下|分析|评价|点评|描述|好看|哪里需要改|帮我改|改一下|修一下|调整一下|增加|删除|去掉|换成|变成)/i.test(
+      normalized,
+    )
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
 function cleanupRecentImageContexts() {
   const now = Date.now();
   for (const [key, context] of recentImageContexts) {
@@ -1055,9 +1081,11 @@ async function handleQqEvent(ws, event) {
     }
   }
 
-  // ----- 最近图片视觉上下文（当前无图无引用时才考虑） -----
+  // ----- 最近图片视觉上下文（仅在本轮明显引用图片时才考虑） -----
+  // 这样仍保留“上一张图怎么样 / 帮我改一下刚才那张图”的能力，
+  // 但不会因为两分钟前发过一张图就把普通数学题也变成视觉任务。
   let recentImageContext = null;
-  if (!imageContent) {
+  if (!imageContent && shouldUseRecentImageContext(userText)) {
     recentImageContext = getRecentImageContext({
       isGroup,
       groupId,
@@ -1127,15 +1155,21 @@ async function handleQqEvent(ws, event) {
   );
 
   // ----- 调用 Core -----
+  const cleanUserHistoryEntry = imageContent
+    ? `[用户发送了一张图片]${userText ? `\n${userText}` : ""}`
+    : userText;
+
   const res = await coreProcessChat(sessionId, finalPrompt, imageContent, {
     isOwner,
     isGroup,
     searchText: userText,
     thinkingText: userText,
+    intentText: userText,
+    historyTextEntry: cleanUserHistoryEntry,
 
     onThinkingStart: async () => {
       console.log(`[QQ思考] AI 已开始 Thinking | session=${sessionId}`);
-      await sendQqMsg(ws, targetId, isGroup, "已开始思考");
+      await sendQqMsg(ws, targetId, isGroup, "让我想想…");
     },
 
     onImageReady: async (image) => {

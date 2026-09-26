@@ -12,6 +12,7 @@ import { generateImage } from "./image.js";
 import { createVideoTask, waitForVideo } from "./video.js";
 import { exaSearch } from "./exa.js";
 
+
 // ============================================================
 // 配置
 // ============================================================
@@ -42,6 +43,123 @@ function shouldEnableThinking(text) {
   const normalized = text.replace(/\s+/g, " ").trim().toLowerCase();
 
   return THINKING_INTENT_PATTERN.test(normalized);
+}
+
+// ============================================================
+// 生成工具意图隔离
+//
+// 重要原则：
+// 1. 思考可以参考历史，但“是否允许生成图片/视频”只看本轮真实用户输入。
+// 2. 群聊历史、搜索结果、最近视频上下文、旧的图片请求都不能单独打开生成权限。
+// 3. 宁可让一次模糊的“帮我做一下”先不生成，也不要因为历史污染而误生成。
+// ============================================================
+
+const GENERATION_METHOD_PATTERN =
+  /怎么|如何|怎样|教程|方法|原理|什么是|是什么|为什么|参数|状态|进度|查询|介绍|能否说明|告诉我怎么|教我/i;
+
+const IMAGE_GENERATION_PATTERN = /(?:画(?:一张|一幅|一个|一只|个)?|绘制|生图|作图|(?:生成|制作|创作|设计|编辑|修改|重画|再画|修图|改图|重新生成)[^\n]{0,24}(?:图片|图像|插画|海报|壁纸|头像|表情包|封面|配图|图)|(?:图片|图像|插画|海报|壁纸|头像|表情包|封面|配图)[^\n]{0,24}(?:生成|制作|创作|设计|编辑|修改|重做|重画|重新生成))/i;
+
+const VIDEO_GENERATION_PATTERN = /(?:(?:生成|制作|创作|编辑|修改|重做|重制|继续|重新生成|做成|变成|来(?:一个|一段|个)?)\s*[^\n]{0,24}(?:视频|短片|动画|动图|片段)|(?:视频|短片|动画|动图|片段)[^\n]{0,24}(?:生成|制作|创作|编辑|修改|重做|重制|继续|重新生成))/i;
+
+const IMAGE_EDIT_WITH_ATTACHMENT_PATTERN =
+  /修改|编辑|重画|修图|改图|去掉|删除|增加|添加|换成|变成|重新生成|重做/i;
+
+const VIDEO_REFERENCE_PATTERN =
+  /刚才(?:那个|的)?视频|上一(?:个|段)?视频|上一个视频|这个视频|该视频|视频|短片|动画|动图|片段/i;
+
+function normalizeIntentText(text) {
+  return String(text || "")
+    .replace(/<thinking>[\s\S]*?<\/thinking>/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function isMethodOrDiscussionRequest(text) {
+  return GENERATION_METHOD_PATTERN.test(normalizeIntentText(text));
+}
+
+function detectGenerationIntent(text, { hasImage = false, hasLastVideo = false } = {}) {
+  const normalized = normalizeIntentText(text);
+
+  if (!normalized) {
+    return { allowImage: false, allowVideo: false, reason: "empty" };
+  }
+
+  // “怎么生成视频 / 图片怎么做 / 视频教程”这类问题不属于生成动作。
+  // 但“帮我生成一个视频”“请画一张图”仍然可以正常通过。
+  const methodLike = isMethodOrDiscussionRequest(normalized);
+  const directGenerationCue =
+    /(?:帮我|请|给我|直接|现在|马上|就|来一个|来个|做一个|做一张|做一幅)/i.test(
+      normalized,
+    );
+
+  const desireGenerationCue =
+    /(?:我要|我想要|想要|来一个|来个|给我一个|给我一张|给我一幅)/i.test(normalized);
+
+  let allowImage = IMAGE_GENERATION_PATTERN.test(normalized);
+  let allowVideo = VIDEO_GENERATION_PATTERN.test(normalized);
+
+  // 当前消息本身带图片时，“帮我修改一下/把它换成……”属于图片编辑。
+  if (hasImage && IMAGE_EDIT_WITH_ATTACHMENT_PATTERN.test(normalized)) {
+    allowImage = true;
+  }
+
+  // 上一段视频只能在本轮明确提到视频/视频上下文并提出操作时继续使用。
+  if (hasLastVideo && VIDEO_REFERENCE_PATTERN.test(normalized)) {
+    if (/(修改|编辑|重做|重制|继续|重新生成|延续|改成|变成|再做|再生成)/i.test(normalized)) {
+      allowVideo = true;
+    }
+  }
+
+  // 对“生成/制作/做一个视频”这类非常明确的直接请求给一个额外容错，
+  // 但仍要求出现视频对象，避免普通“生成一个答案/总结”打开视频权限。
+  if (
+    directGenerationCue &&
+    /视频|短片|动画|动图|片段/i.test(normalized) &&
+    /(生成|制作|创作|编辑|修改|重做|重制|继续|再做|再生成|做成|变成|来一个|来个|做一个|我想要|我要)/i.test(
+      normalized,
+    )
+  ) {
+    allowVideo = true;
+  }
+
+  // 对图片同样增加容错，但“生成一个数学答案”不会因为这里而打开图片工具。
+  if (
+    directGenerationCue &&
+    /图片|图像|插画|海报|壁纸|头像|表情包|封面|配图/i.test(normalized) &&
+    /(生成|制作|创作|设计|编辑|修改|重做|重画|再画|做成|变成|来一张|来一幅|做一张|做一幅|画)/i.test(
+      normalized,
+    )
+  ) {
+    allowImage = true;
+  }
+
+  // 典型“怎么/如何/教程/原理”问题不执行生成动作。
+  // 但“分析这张图，然后生成一张新图”属于真实生成请求，不应被“分析”本身拦截。
+  if (methodLike && !directGenerationCue && !desireGenerationCue) {
+    // 只有当用户是在问生成方法，而不是直接下达生成/编辑动作时才拦截。
+    const asksHowToGenerate =
+      /(?:怎么|如何|怎样|教程|方法|原理|什么是|是什么|为什么|能否说明|告诉我怎么|教我)[^\n]{0,24}(?:生成|制作|画|绘制|图片|图像|视频|短片|动画)/i.test(
+        normalized,
+      );
+
+    if (asksHowToGenerate || !allowImage && !allowVideo) {
+      allowImage = false;
+      allowVideo = false;
+    }
+  }
+
+  // “我要一个视频 / 我想要一张图”属于直接需求，而不是教程问题。
+  if (!methodLike && desireGenerationCue) {
+    if (/视频|短片|动画|动图|片段/i.test(normalized)) allowVideo = true;
+    if (/图片|图像|插画|海报|壁纸|头像|表情包|封面|配图|图/i.test(normalized)) allowImage = true;
+  }
+
+  return {
+    allowImage,
+    allowVideo,
+    reason: `image=${allowImage},video=${allowVideo}`,
+  };
 }
 
 // API 流式请求：只限制首个 SSE 数据块的等待时间
@@ -1330,6 +1448,10 @@ async function coreProcessChat(
     isGroup = false,
     searchText = null,
 
+    // 本轮“真正的用户输入”，不要使用包含群历史/系统提示的 finalPrompt。
+    intentText = null,
+    suppliedHistoryTextEntry = null,
+
     thinkingText = null,
 
     onThinkingStart = null,
@@ -1347,12 +1469,25 @@ async function coreProcessChat(
   const history = getHistory(sessionId);
 
   // ==========================================================
-  // Thinking 判断
+  // Thinking / Tool 意图判断
   // ==========================================================
 
   const actualThinkingText = thinkingText !== null ? thinkingText : userText;
+  const actualIntentText = intentText !== null ? intentText : actualThinkingText;
 
   const thinkingEnabled = shouldEnableThinking(actualThinkingText);
+
+  const generationIntent = detectGenerationIntent(actualIntentText, {
+    hasImage: Boolean(imageContent),
+    hasLastVideo: Boolean(getLastVideo(sessionId)),
+  });
+
+  // 历史只作为上下文，不成为本轮生成权限的来源。
+  const effectiveHistoryTextEntry =
+  suppliedHistoryTextEntry !== null &&
+  suppliedHistoryTextEntry !== undefined
+    ? String(suppliedHistoryTextEntry)
+    : String(userText || "");
 
   let totalThinkingDurationMs = 0;
 
@@ -1369,6 +1504,11 @@ async function coreProcessChat(
   // ==========================================================
 
   let webSearchUsed = false;
+
+  // 当前请求级工具状态，不进入 history，不跨对话共享
+  const toolState = {
+    webSearchCount: 0,
+  };
 
   let thinkingStartNotified = false;
 
@@ -1387,6 +1527,11 @@ async function coreProcessChat(
   console.log(
     `[Core] Thinking 判断 | enabled=${thinkingEnabled} | ` +
       `text=${String(actualThinkingText || "").slice(0, 100)}`,
+  );
+
+  console.log(
+    `[Core] 生成权限判断 | ${generationIntent.reason} | ` +
+      `intent=${normalizeIntentText(actualIntentText).slice(0, 120)}`,
   );
 
   const lastVideo = getLastVideo(sessionId);
@@ -1447,9 +1592,18 @@ async function coreProcessChat(
 不要把工具调用或参数写成普通文本。
 `;
 
-  if (lastVideo) {
+  // 最近视频只有在本轮明确提到视频时才注入。
+  // “视频怎么生成/视频状态”可以继续看到视频上下文，但不会因此获得生成权限。
+  if (lastVideo && VIDEO_REFERENCE_PATTERN.test(normalizeIntentText(actualIntentText))) {
     systemContent += "\n\n" + buildLastVideoContext(lastVideo);
   }
+
+  systemContent += `
+【生成工具隔离】
+图片/视频生成工具的可用性只由本轮真实用户输入决定。历史对话、群聊历史、搜索结果、旧的图片/视频请求都不能单独触发生成。即使历史里刚刚生成过图片或视频，只要本轮没有明确要求生成/修改对应媒体，就不要尝试调用生成工具。
+本轮图片工具：${generationIntent.allowImage ? "可用" : "不可用"}
+本轮视频工具：${generationIntent.allowVideo ? "可用" : "不可用"}
+`;
 
   // ==========================================================
   // Messages
@@ -1493,9 +1647,23 @@ ${searchInfo}`,
     // 而是模型收到的工具定义中已经不存在搜索工具。
     // ========================================================
 
-    const availableTools = webSearchUsed
-      ? TOOLS.filter((tool) => tool.function?.name !== "web_search")
-      : TOOLS;
+    const availableTools = TOOLS.filter((tool) => {
+      const name = tool.function?.name;
+
+      if (name === "web_search") {
+        return !webSearchUsed;
+      }
+
+      if (name === "generate_image") {
+        return generationIntent.allowImage;
+      }
+
+      if (name === "generate_video") {
+        return generationIntent.allowVideo;
+      }
+
+      return true;
+    });
 
     const payload = {
       model: MODEL,
@@ -1627,7 +1795,7 @@ ${searchInfo}`,
 
       history.push({
         role: "user",
-        content: historyTextEntry,
+        content: effectiveHistoryTextEntry,
       });
 
       history.push({
@@ -1665,24 +1833,15 @@ ${searchInfo}`,
     // 这样从上下文层面直接把重复搜索 Call 丢掉。
     // ========================================================
 
-    let firstWebSearchSeen = false;
-
     const filteredToolCalls = [];
 
     for (const toolCall of toolCalls) {
       const name = toolCall?.function?.name;
 
-      if (name === "web_search") {
-        if (webSearchUsed || firstWebSearchSeen) {
-          console.warn(
-            `[Core] 丢弃重复 web_search Tool Call | ` +
-              `id=${toolCall?.id || "unknown"}`,
-          );
-
-          continue;
-        }
-
-        firstWebSearchSeen = true;
+      // 同一轮只允许一个搜索执行，但不要破坏 assistant tool_calls 结构
+      if (name === "web_search" && (webSearchUsed || toolState.webSearchCount > 0)) {
+        console.warn(`[Core] 跳过额外 web_search 执行 | id=${toolCall?.id || "unknown"}`);
+        continue;
       }
 
       filteredToolCalls.push(toolCall);
@@ -1732,7 +1891,7 @@ ${searchInfo}`,
 
       history.push({
         role: "user",
-        content: historyTextEntry,
+        content: effectiveHistoryTextEntry,
       });
 
       history.push({
@@ -1808,6 +1967,7 @@ ${searchInfo}`,
         // ====================================================
 
         webSearchUsed = true;
+        toolState.webSearchCount++;
 
         console.log(`[Core] web_search 唯一一次 | query=${query}`);
 
@@ -1887,10 +2047,22 @@ ${searchInfo}`,
       // ======================================================
 
       if (name === "generate_image") {
+        if (!generationIntent.allowImage) {
+          console.warn("[Core] 拒绝非本轮意图触发的图片生成 Tool Call");
+          workingMessages.push({
+            role: "tool",
+            tool_call_id: toolCallId,
+            name: "generate_image",
+            content: "本轮用户没有明确要求生成或修改图片，因此本次图片生成调用被拦截。请直接回答当前问题。",
+          });
+          needContinue = true;
+          continue;
+        }
+
         return executeImageTool({
           sessionId,
           history,
-          historyTextEntry,
+          historyTextEntry: effectiveHistoryTextEntry,
           args,
           onImageReady,
           onImageError,
@@ -1902,10 +2074,22 @@ ${searchInfo}`,
       // ======================================================
 
       if (name === "generate_video") {
+        if (!generationIntent.allowVideo) {
+          console.warn("[Core] 拒绝非本轮意图触发的视频生成 Tool Call");
+          workingMessages.push({
+            role: "tool",
+            tool_call_id: toolCallId,
+            name: "generate_video",
+            content: "本轮用户没有明确要求生成或修改视频，因此本次视频生成调用被拦截。请直接回答当前问题。",
+          });
+          needContinue = true;
+          continue;
+        }
+
         return executeVideoTool({
           sessionId,
           history,
-          historyTextEntry,
+          historyTextEntry: effectiveHistoryTextEntry,
           args,
           lastVideo,
           onVideoReady,
