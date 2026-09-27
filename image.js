@@ -6,10 +6,6 @@ import {
   IMAGE_MODEL,
 } from "./config.js";
 
-// ============================================================
-// 配置
-// ============================================================
-
 const IMAGE_SIZES = {
   "1:1": "1024x1024",
   "4:3": "1024x768",
@@ -20,29 +16,25 @@ const IMAGE_SIZES = {
 
 const DEFAULT_RATIO = "4:3";
 
-// ============================================================
-// 图片生成
-//
-// mode:
-//   new       = 创建新图片
-//   edit_last = 修改上一张图片
-//
-// sourceImageUrl:
-//   edit_last 时必须提供
-// ============================================================
-
+/**
+ * 生成图片 / 图生图 / 多图合成
+ *
+ * mode:
+ *   new       = 创建新图片
+ *   edit_last = 使用 sourceImageUrls 中的图片进行图生图/多图合成
+ *
+ * sourceImageUrls:
+ *   传给 AGNES extra_body.image 的 URL 数组
+ */
 async function generateImage(
   prompt,
   ratio = DEFAULT_RATIO,
   {
     mode = "new",
     sourceImageUrl = null,
+    sourceImageUrls = [],
   } = {},
 ) {
-  // ==========================================================
-  // 1. 基础参数检查
-  // ==========================================================
-
   if (typeof prompt !== "string" || !prompt.trim()) {
     throw new Error("图片提示词不能为空");
   }
@@ -51,54 +43,41 @@ async function generateImage(
     throw new Error(`不支持的图片模式：${mode}`);
   }
 
-  if (mode === "edit_last") {
-    if (
-      typeof sourceImageUrl !== "string" ||
-      !sourceImageUrl.trim()
-    ) {
-      throw new Error("edit_last 缺少 sourceImageUrl");
-    }
+  const size = IMAGE_SIZES[ratio] || IMAGE_SIZES[DEFAULT_RATIO];
+
+  const normalizedSources = [
+    ...(Array.isArray(sourceImageUrls) ? sourceImageUrls : []),
+    ...(sourceImageUrl ? [sourceImageUrl] : []),
+  ]
+    .filter((value) => typeof value === "string" && value.trim())
+    .map((value) => value.trim())
+    .filter((value, index, arr) => arr.indexOf(value) === index);
+
+  if (mode === "edit_last" && normalizedSources.length === 0) {
+    throw new Error("edit_last 缺少可用的源图片 URL");
   }
 
-  const size =
-    IMAGE_SIZES[ratio] ||
-    IMAGE_SIZES[DEFAULT_RATIO];
+  // 严格按 AGNES 图片 API 示例组织请求。
+  // 图生图 / 多图合成：extra_body.image = [url1, url2, ...]
+  // 统一要求返回 URL，方便 QQ 直接发送。
+  const extraBody = {
+    response_format: "url",
+  };
 
-  // ==========================================================
-  // 2. 基础请求参数
-  // ==========================================================
+  if (mode === "edit_last") {
+    extraBody.image = normalizedSources;
+  }
 
   const payload = {
     model: IMAGE_MODEL,
     prompt: prompt.trim(),
-    n: 1,
     size,
+    extra_body: extraBody,
   };
 
-  // ==========================================================
-  // 3. 图片编辑
-  //
-  // 注意：
-  // 这里的字段名必须和你的 AGNES 图片 API 实际接口一致。
-  //
-  // 如果你的 API 使用 source_image_url，
-  // 就保持下面这样。
-  // ==========================================================
-
-  if (mode === "edit_last") {
-    payload.source_image_url = sourceImageUrl.trim();
-  }
-
   console.log(
-    `[Image] 请求图片 | ` +
-      `mode=${mode} | ` +
-      `ratio=${ratio} | ` +
-      `size=${size}`,
+    `[Image] 请求图片 | mode=${mode} | ratio=${ratio} | size=${size} | sources=${normalizedSources.length}`,
   );
-
-  // ==========================================================
-  // 4. 请求 API
-  // ==========================================================
 
   try {
     const response = await axios.post(
@@ -109,51 +88,49 @@ async function generateImage(
           Authorization: `Bearer ${AGNES_API_KEY}`,
           "Content-Type": "application/json",
         },
-
         timeout: 60000,
         maxRedirects: 10,
       },
     );
 
-    const url =
-      response.data?.data?.[0]?.url;
+    const first = response.data?.data?.[0];
+    const url = typeof first?.url === "string" ? first.url.trim() : "";
 
-    if (!url) {
-      throw new Error(
-        "API 没有返回图片 URL：" +
-          JSON.stringify(response.data),
+    if (url) {
+      console.log(
+        `[Image] 图片生成完成 | mode=${mode} | sources=${normalizedSources.length}`,
       );
+      return url;
     }
 
-    console.log(
-      `[Image] 图片生成完成 | mode=${mode}`,
-    );
+    // 兼容 API 偶尔返回 b64_json 的情况。
+    const b64 = typeof first?.b64_json === "string" ? first.b64_json.trim() : "";
+    if (b64) {
+      console.log(
+        `[Image] 图片生成完成（b64_json） | mode=${mode} | sources=${normalizedSources.length}`,
+      );
+      return `data:image/png;base64,${b64}`;
+    }
 
-    return url;
+    throw new Error(
+      "API 没有返回图片 URL：" + JSON.stringify(response.data),
+    );
   } catch (error) {
     console.error(
-      `[Image] 图片生成失败 | mode=${mode}:`,
+      `[Image] 图片生成失败 | mode=${mode} | sources=${normalizedSources.length}:`,
       error.message,
     );
 
     if (error.response?.data) {
       console.error(
         "[Image] API 返回:",
-        JSON.stringify(
-          error.response.data,
-          null,
-          2,
-        ),
+        JSON.stringify(error.response.data, null, 2),
       );
     }
 
     throw error;
   }
 }
-
-// ============================================================
-// 导出
-// ============================================================
 
 export {
   generateImage,

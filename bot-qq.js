@@ -8,13 +8,11 @@ import { NAPCAT_WS_URL, NAPCAT_HTTP_URL, NAPCAT_TOKEN } from "./config.js";
 import { coreProcessChat, clearHistory, clearAllHistories } from "./core.js";
 import { sendSpecialContent } from "./special-content.js";
 import { handleControlCommand } from "./control.js";
-import { getServerStatus, checkServerStatusRateLimit } from "./server-status.js";
 import {
-  IMAGE_SOURCE,
-  rememberOutboundImage,
-  getOutboundImageSource,
-  isHistoricalImageSource,
-} from "./image-provenance.js";
+  getServerStatus,
+  checkServerStatusRateLimit,
+} from "./server-status.js";
+import { IMAGE_SOURCE } from "./image-provenance.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -46,20 +44,36 @@ function getRecentImageContextKey(isGroup, groupId, userId) {
     : `private:${String(userId)}`;
 }
 
-function saveRecentImageContext({ isGroup, groupId, userId, imageContent, messageId, messageTime }) {
+function saveRecentImageContext({
+  isGroup,
+  groupId,
+  userId,
+  imageContent,
+  sourceImageUrl = null,
+  messageId,
+  messageTime,
+}) {
   if (!imageContent) return;
   const key = getRecentImageContextKey(isGroup, groupId, userId);
   recentImageContexts.set(key, {
     imageContent,
+    sourceImageUrl: sourceImageUrl || null,
     messageId: messageId ?? null,
     messageTime: Number(messageTime || 0),
     senderId: String(userId),
     savedAt: Date.now(),
   });
-  console.log(`[QQ图片] 缓存最近图片 | key=${key} | sender=${userId} | message_id=${messageId ?? "unknown"}`);
+  console.log(
+    `[QQ图片] 缓存最近图片 | key=${key} | sender=${userId} | message_id=${messageId ?? "unknown"}`,
+  );
 }
 
-function getRecentImageContext({ isGroup, groupId, userId, currentMessageId = null }) {
+function getRecentImageContext({
+  isGroup,
+  groupId,
+  userId,
+  currentMessageId = null,
+}) {
   const key = getRecentImageContextKey(isGroup, groupId, userId);
   const context = recentImageContexts.get(key);
   if (!context) return null;
@@ -67,7 +81,9 @@ function getRecentImageContext({ isGroup, groupId, userId, currentMessageId = nu
   const age = Date.now() - context.savedAt;
   if (age > RECENT_IMAGE_CONTEXT_TTL_MS) {
     recentImageContexts.delete(key);
-    console.log(`[QQ图片] 最近图片已过期 | key=${key} | age=${Math.round(age / 1000)}s`);
+    console.log(
+      `[QQ图片] 最近图片已过期 | key=${key} | age=${Math.round(age / 1000)}s`,
+    );
     return null;
   }
 
@@ -81,32 +97,6 @@ function getRecentImageContext({ isGroup, groupId, userId, currentMessageId = nu
   }
 
   return context;
-}
-
-function shouldUseRecentImageContext(text) {
-  const normalized = String(text || "")
-    .replace(/\s+/g, " ")
-    .trim();
-
-  if (!normalized) return false;
-
-  // 明确视觉对象：只要当前消息点名图片/截图/照片/头像等，就允许取最近图片。
-  if (/这张|这幅|这图|这图片|刚才(?:那张|那个)?图|上一张|上面的图|截图|照片|图片|图像|插画|头像|壁纸|海报|配图/i.test(normalized)) {
-    return true;
-  }
-
-  // 没点名“图片”时，只接受“这个/它/刚才那个”这类承接式引用，
-  // 再叠加明显的视觉处理/评价动作；普通“分析一下”“怎么样”不会触发。
-  if (
-    /(?:这个|这个东西|它|刚才那个|刚刚那个|上一张)/i.test(normalized) &&
-    /(?:看看|看一下|分析|评价|点评|描述|好看|哪里需要改|帮我改|改一下|修一下|调整一下|增加|删除|去掉|换成|变成)/i.test(
-      normalized,
-    )
-  ) {
-    return true;
-  }
-
-  return false;
 }
 
 function cleanupRecentImageContexts() {
@@ -133,8 +123,11 @@ function normalizeBotConfig(config) {
 
   return {
     ownerQQ: source.ownerQQ !== undefined ? String(source.ownerQQ) : "",
-    nickname: source.nickname !== undefined ? String(source.nickname) : "Yuragi",
-    blacklistQQ: Array.isArray(source.blacklistQQ) ? source.blacklistQQ.map(String) : [],
+    nickname:
+      source.nickname !== undefined ? String(source.nickname) : "Yuragi",
+    blacklistQQ: Array.isArray(source.blacklistQQ)
+      ? source.blacklistQQ.map(String)
+      : [],
     noRandomTalkGroups: Array.isArray(source.noRandomTalkGroups)
       ? source.noRandomTalkGroups.map(String)
       : [],
@@ -182,7 +175,9 @@ function reloadBotConfigIfChanged() {
   }
 }
 
-fs.watchFile(BOT_CONFIG_PATH, { interval: 1000 }, () => reloadBotConfigIfChanged());
+fs.watchFile(BOT_CONFIG_PATH, { interval: 1000 }, () =>
+  reloadBotConfigIfChanged(),
+);
 
 function getBotConfig() {
   reloadBotConfigIfChanged();
@@ -247,7 +242,13 @@ function getGroupHistoryClearTime(groupId) {
   return Math.max(globalTime, localTime);
 }
 
-function handleBotControlCommand({ command, sessionId, groupId, isGroup, messageTime }) {
+function handleBotControlCommand({
+  command,
+  sessionId,
+  groupId,
+  isGroup,
+  messageTime,
+}) {
   if (!command) return null;
 
   if (command.action === "clear") {
@@ -276,34 +277,30 @@ function handleBotControlCommand({ command, sessionId, groupId, isGroup, message
 // ===== QQ 消息段 =====
 
 function buildQqTextSegments(text) {
-  const segments = [];
-  const pattern = /\[CQ:at,qq=(\d{5,12}|all)\]|@(\d{5,12})/g;
-  let lastIndex = 0;
-
-  for (let match; (match = pattern.exec(text)) !== null; ) {
-    const index = match.index;
-    if (index > lastIndex) {
-      const plainText = text.slice(lastIndex, index);
-      if (plainText) segments.push({ type: "text", data: { text: plainText } });
-    }
-    const qq = match[1] || match[2];
-    segments.push({ type: "at", data: { qq: String(qq) } });
-    lastIndex = index + match[0].length;
-  }
-
-  if (lastIndex < text.length) {
-    const remaining = text.slice(lastIndex);
-    if (remaining) segments.push({ type: "text", data: { text: remaining } });
-  }
-
-  if (!segments.length) return [{ type: "text", data: { text } }];
-  return segments;
+  const value = String(text || "");
+  return value ? [{ type: "text", data: { text: value } }] : [];
 }
 
-async function sendQqMsg(ws, targetId, isGroup, text = null, imgUrl = null, imageSource = null) {
+async function sendQqMsg(
+  ws,
+  targetId,
+  isGroup,
+  text = null,
+  imgUrl = null,
+  imageSource = null,
+  mentionQqs = [],
+) {
   const action = isGroup ? "send_group_msg" : "send_private_msg";
   const params = { [isGroup ? "group_id" : "user_id"]: targetId };
   const messageChain = [];
+
+  for (const qq of Array.isArray(mentionQqs) ? mentionQqs : []) {
+    const value = String(qq ?? "").trim();
+    if (!value) continue;
+    if (value === "all" || /^\d{5,12}$/.test(value)) {
+      messageChain.push({ type: "at", data: { qq: value } });
+    }
+  }
 
   if (text) {
     const cleanText = sanitizeOutput(text);
@@ -315,11 +312,25 @@ async function sendQqMsg(ws, targetId, isGroup, text = null, imgUrl = null, imag
   params.message = messageChain;
   console.log(`[QQ发送] 正在发送消息给 ${targetId}...`);
 
+  if (NAPCAT_HTTP_URL && NAPCAT_TOKEN) {
+    const result = await callNapCatHttp(action, params);
+    if (result) {
+      console.log(
+        `[QQ发送] 已通过 NapCat HTTP 发送 | ${targetId} | ${isGroup ? "群聊" : "私聊"}`,
+      );
+      return true;
+    }
+  }
+
   if (!ws || ws.readyState !== WebSocket.OPEN) {
     throw new Error("NapCat WebSocket 当前未连接");
   }
 
   ws.send(JSON.stringify({ action, params }));
+  console.log(
+    `[QQ发送] 已通过 WebSocket 发送 | ${targetId} | ${isGroup ? "群聊" : "私聊"}`,
+  );
+  return true;
 }
 
 // ===== AI 消息拆分 =====
@@ -334,17 +345,36 @@ function splitQqMessages(text) {
 
 // ===== 发送 AI 文本 =====
 
-async function sendAiTextMessages(ws, targetId, isGroup, text) {
+async function sendAiTextMessages(
+  ws,
+  targetId,
+  isGroup,
+  text,
+  mentionQqs = [],
+) {
   const messages = splitQqMessages(text);
-  if (!messages.length) return;
+  const mentions = Array.isArray(mentionQqs)
+    ? [
+        ...new Set(
+          mentionQqs
+            .map((value) => String(value ?? "").trim())
+            .filter((value) => value === "all" || /^\d{5,12}$/.test(value)),
+        ),
+      ]
+    : [];
+
+  if (!messages.length && !mentions.length) return;
+
+  let mentionsAttached = false;
 
   for (let i = 0; i < messages.length; i++) {
     const message = sanitizeOutput(messages[i]);
     if (!message) continue;
 
-    const hasRawAt = /(?:\[CQ:at,qq=\d{5,12}\]|@\d{5,12})/.test(message);
-    if (hasRawAt) {
-      await sendQqMsg(ws, targetId, isGroup, message);
+    // 有真实 @ 时，必须与正文放在同一个 OneBot message 数组里发送。
+    if (!mentionsAttached && mentions.length) {
+      await sendQqMsg(ws, targetId, isGroup, message, null, null, mentions);
+      mentionsAttached = true;
     } else {
       await sendSpecialContent(targetId, isGroup, message);
     }
@@ -352,6 +382,11 @@ async function sendAiTextMessages(ws, targetId, isGroup, text) {
     if (i < messages.length - 1) {
       await new Promise((resolve) => setTimeout(resolve, 80));
     }
+  }
+
+  // 没有正文时，也至少把 @ 发出去。
+  if (!mentionsAttached && mentions.length) {
+    await sendQqMsg(ws, targetId, isGroup, null, null, null, mentions);
   }
 }
 
@@ -386,7 +421,9 @@ async function sendQqMention(ws, groupId, userId) {
       console.log(`[QQ@] 已通过 NapCat WebSocket 发送真实 @ -> ${qq}`);
       return true;
     } catch (error) {
-      console.error(`[QQ@] WebSocket 发送失败: ${error.name}: ${error.message}`);
+      console.error(
+        `[QQ@] WebSocket 发送失败: ${error.name}: ${error.message}`,
+      );
     }
   }
 
@@ -410,14 +447,21 @@ async function callNapCatHttp(action, params) {
     });
 
     const result = response.data;
-    if (result && result.retcode !== undefined && Number(result.retcode) !== 0) {
+    if (
+      result &&
+      result.retcode !== undefined &&
+      Number(result.retcode) !== 0
+    ) {
       throw new Error(
-        `NapCat retcode=${result.retcode}` + (result.message ? `: ${result.message}` : ""),
+        `NapCat retcode=${result.retcode}` +
+          (result.message ? `: ${result.message}` : ""),
       );
     }
     return result;
   } catch (error) {
-    console.error(`[NapCat HTTP] ${action} 调用失败: ${error.name}: ${error.message}`);
+    console.error(
+      `[NapCat HTTP] ${action} 调用失败: ${error.name}: ${error.message}`,
+    );
     return null;
   }
 }
@@ -442,7 +486,9 @@ async function sendQqVideo(ws, targetId, isGroup, videoUrl) {
   if (NAPCAT_HTTP_URL && NAPCAT_TOKEN) {
     const result = await callNapCatHttp(action, params);
     if (result) {
-      console.log(`[QQ视频] 已通过 NapCat HTTP 提交视频发送任务 -> ${targetId}`);
+      console.log(
+        `[QQ视频] 已通过 NapCat HTTP 提交视频发送任务 -> ${targetId}`,
+      );
       return true;
     }
   }
@@ -453,7 +499,9 @@ async function sendQqVideo(ws, targetId, isGroup, videoUrl) {
       console.log(`[QQ视频] 已通过 WebSocket 发送视频 -> ${targetId}`);
       return true;
     } catch (error) {
-      console.error(`[QQ视频] WebSocket 发送失败: ${error.name}: ${error.message}`);
+      console.error(
+        `[QQ视频] WebSocket 发送失败: ${error.name}: ${error.message}`,
+      );
     }
   }
 
@@ -552,21 +600,77 @@ function messageSegmentsToText(message) {
 
 // ===== 下载图片 =====
 
-async function downloadImageAsBase64(imgUrl, timeout = 5000) {
+function getImageMimeType(source, contentType = "") {
+  const type = String(contentType || "").toLowerCase();
+  if (type.includes("png")) return "image/png";
+  if (type.includes("webp")) return "image/webp";
+  if (type.includes("gif")) return "image/gif";
+  if (type.includes("bmp")) return "image/bmp";
+  if (type.includes("avif")) return "image/avif";
+
+  const ext = String(source || "")
+    .split(/[?#]/)[0]
+    .toLowerCase();
+  if (ext.endsWith(".png")) return "image/png";
+  if (ext.endsWith(".webp")) return "image/webp";
+  if (ext.endsWith(".gif")) return "image/gif";
+  if (ext.endsWith(".bmp")) return "image/bmp";
+  if (ext.endsWith(".avif")) return "image/avif";
+  return "image/jpeg";
+}
+
+async function downloadImageAsBase64(imgUrl, timeout = 10000) {
   if (!imgUrl) return null;
+
+  const source = String(imgUrl).trim();
+  if (!source) return null;
+
+  if (/^data:image\//i.test(source)) return source;
+
+  if (/^base64:\/\//i.test(source)) {
+    const base64 = source.slice("base64://".length).trim();
+    return base64 ? `data:image/png;base64,${base64}` : null;
+  }
+
   try {
-    const response = await httpClient.get(imgUrl, {
+    let localPath = null;
+
+    if (/^file:\/\//i.test(source)) {
+      try {
+        localPath = fileURLToPath(source);
+      } catch {
+        localPath = null;
+      }
+    } else if (path.isAbsolute(source)) {
+      localPath = source;
+    }
+
+    if (localPath && fs.existsSync(localPath)) {
+      const buffer = await fs.promises.readFile(localPath);
+      if (!buffer.length) return null;
+      const mimeType = getImageMimeType(localPath);
+      return `data:${mimeType};base64,${buffer.toString("base64")}`;
+    }
+
+    if (!/^https?:\/\//i.test(source)) {
+      return null;
+    }
+
+    const response = await httpClient.get(source, {
       timeout,
       responseType: "arraybuffer",
+      maxContentLength: 15 * 1024 * 1024,
+      maxBodyLength: 15 * 1024 * 1024,
+      headers: {
+        Accept: "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+      },
     });
-    const contentType = String(response.headers["content-type"] || "").toLowerCase();
-    let mimeType = "image/jpeg";
-    if (contentType.includes("png")) mimeType = "image/png";
-    else if (contentType.includes("webp")) mimeType = "image/webp";
-    else if (contentType.includes("gif")) mimeType = "image/gif";
 
-    const base64Img = Buffer.from(response.data).toString("base64");
-    return `data:${mimeType};base64,${base64Img}`;
+    const buffer = Buffer.from(response.data || []);
+    if (!buffer.length) return null;
+
+    const mimeType = getImageMimeType(source, response.headers["content-type"]);
+    return `data:${mimeType};base64,${buffer.toString("base64")}`;
   } catch (error) {
     console.error(`[QQ图片] 图片下载失败: ${error.name}: ${error.message}`);
     return null;
@@ -574,6 +678,20 @@ async function downloadImageAsBase64(imgUrl, timeout = 5000) {
 }
 
 // ===== 获取指定 QQ 消息 =====
+
+function extractImageSourceFromMessage(message) {
+  if (!message || typeof message !== "object") return null;
+
+  const segments = Array.isArray(message.message) ? message.message : [];
+  for (const seg of segments) {
+    if (!seg || typeof seg !== "object" || seg.type !== "image") continue;
+    const data = seg.data && typeof seg.data === "object" ? seg.data : {};
+    const source = data.url || data.file;
+    if (source) return String(source);
+  }
+
+  return null;
+}
 
 async function fetchQqMessage(messageId) {
   if (!NAPCAT_HTTP_URL || !NAPCAT_TOKEN) return null;
@@ -590,7 +708,7 @@ async function fetchQqMessage(messageId) {
           Authorization: `Bearer ${NAPCAT_TOKEN}`,
           "Content-Type": "application/json",
         },
-        timeout: 4000,
+        timeout: 8000,
       },
     );
 
@@ -607,42 +725,98 @@ async function fetchQqMessage(messageId) {
   }
 }
 
+function buildQuotedMessageContext(message, { selfId = null } = {}) {
+  if (!message || typeof message !== "object") return "";
+
+  const senderId = String(message.user_id ?? "未知");
+  const sender =
+    message.sender && typeof message.sender === "object" ? message.sender : {};
+  const isSelf =
+    selfId !== null && selfId !== undefined && senderId === String(selfId);
+  const senderName = sender.card || sender.nickname || senderId;
+  const label = isSelf ? "你（机器人）" : `群友「${senderName}」`;
+  const text = messageSegmentsToText(message.message || []).trim();
+  const hasImage =
+    Array.isArray(message.message) &&
+    message.message.some((seg) => seg?.type === "image");
+
+  if (!text && !hasImage) return "";
+
+  const parts = [`[引用消息]\n发送者：${label} [QQ:${senderId}]`];
+  if (text) parts.push(`内容：${text}`);
+  if (hasImage) parts.push("内容中包含图片。");
+  return parts.join("\n");
+}
+
 // ===== 从消息中提取图片 =====
 
-async function extractImageFromMessage(message, { selfId = null } = {}) {
-  if (!message || typeof message !== "object") return null;
+async function getImageResourceFromNapCat(file) {
+  if (!file || !NAPCAT_HTTP_URL || !NAPCAT_TOKEN) return null;
 
-  const senderId = String(message.user_id ?? "");
+  const result = await callNapCatHttp("get_image", { file: String(file) });
+  const data =
+    result?.data && typeof result.data === "object" ? result.data : result;
+  if (!data || typeof data !== "object") return null;
 
-  if (selfId !== null && selfId !== undefined && senderId === String(selfId)) {
-    const source = getOutboundImageSource(message.message_id);
-    // 只有历史图片才允许重新进入视觉上下文
-    if (!isHistoricalImageSource(source)) {
-      console.log(
-        `[QQ引用] 忽略机器人非历史图片 | message_id=${message.message_id} | source=${source ?? "unknown"}`,
+  return data.url || data.file || data.path || null;
+}
+
+async function downloadImageReference(data, timeout = 15000) {
+  const direct = data?.url || null;
+  const file = data?.file || null;
+
+  // 1. NapCat 有可直接访问的 URL 时优先使用，避免无意义的 get_image 请求。
+  if (direct) {
+    const imageContent = await downloadImageAsBase64(direct, timeout);
+    if (imageContent) return imageContent;
+  }
+
+  // 2. 只有 file 时通过 OneBot get_image 获取图片资源。
+  if (file) {
+    try {
+      const resolved = await getImageResourceFromNapCat(file);
+      if (resolved) {
+        const imageContent = await downloadImageAsBase64(resolved, timeout);
+        if (imageContent) return imageContent;
+      }
+    } catch (error) {
+      console.warn(
+        `[QQ图片] get_image 回退失败 | file=${String(file).slice(0, 120)} | ${error.message}`,
       );
-      return null;
     }
   }
 
-  const segments = message.message;
-  if (!Array.isArray(segments)) return null;
+  // 3. 某些实现直接把 file 当 URL/file:///绝对路径返回，再做一次兜底。
+  if (file && file !== direct) {
+    const imageContent = await downloadImageAsBase64(file, timeout);
+    if (imageContent) return imageContent;
+  }
+
+  return null;
+}
+
+async function extractImageFromMessage(message) {
+  if (!message || typeof message !== "object") return null;
+
+  const segments = Array.isArray(message.message) ? message.message : [];
 
   for (const seg of segments) {
     if (!seg || typeof seg !== "object" || seg.type !== "image") continue;
     const data = seg.data && typeof seg.data === "object" ? seg.data : {};
-    const imgUrl = data.url || data.file;
-    if (!imgUrl) continue;
-
-    const imageContent = await downloadImageAsBase64(imgUrl, 5000);
+    const imageContent = await downloadImageReference(data, 10000);
     if (imageContent) return imageContent;
   }
+
   return null;
 }
 
 // ===== 获取群聊历史 =====
 
-async function fetchGroupHistory(groupId, currentMessageId = null) {
+async function fetchGroupHistory(
+  groupId,
+  currentMessageId = null,
+  selfId = null,
+) {
   if (!NAPCAT_HTTP_URL || !NAPCAT_TOKEN) return "";
   const url = NAPCAT_HTTP_URL.replace(/\/+$/, "") + "/get_group_msg_history";
 
@@ -667,7 +841,8 @@ async function fetchGroupHistory(groupId, currentMessageId = null) {
 
     const data = result.data;
     let msgs = [];
-    if (data && typeof data === "object" && !Array.isArray(data)) msgs = data.messages || [];
+    if (data && typeof data === "object" && !Array.isArray(data))
+      msgs = data.messages || [];
     else if (Array.isArray(data)) msgs = data;
     if (!msgs.length) return "";
 
@@ -689,7 +864,10 @@ async function fetchGroupHistory(groupId, currentMessageId = null) {
       if (isBlacklisted(m.user_id)) continue;
 
       const sender = m.sender && typeof m.sender === "object" ? m.sender : {};
-      const sName = sender.card || sender.nickname || String(m.user_id ?? "未知");
+      const senderId = String(m.user_id ?? "未知");
+      const isSelf =
+        selfId !== null && selfId !== undefined && senderId === String(selfId);
+      const sName = sender.card || sender.nickname || senderId;
 
       let rawTxt = messageSegmentsToText(m.message || []).trim();
       if (!rawTxt) continue;
@@ -698,7 +876,11 @@ async function fetchGroupHistory(groupId, currentMessageId = null) {
       if (!cleanRaw) continue;
 
       cleanRaw = cleanRaw.slice(0, 100);
-      formattedMsgs.push(`${sName} [QQ:${m.user_id}]: ${cleanRaw}`);
+      formattedMsgs.push(
+        isSelf
+          ? `你（机器人） [QQ:${senderId}]: ${cleanRaw}`
+          : `群友「${sName}」 [QQ:${senderId}]: ${cleanRaw}`,
+      );
     }
 
     if (!formattedMsgs.length) return "";
@@ -734,7 +916,8 @@ async function randomPokeLoop(ws, signal) {
       }
       if (!candidates.length) continue;
 
-      const selected = candidates[Math.floor(Math.random() * candidates.length)];
+      const selected =
+        candidates[Math.floor(Math.random() * candidates.length)];
       console.log(
         `[QQ主动戳戳] 随机选择用户: user_id=${selected.userId}, group_id=${selected.groupId}`,
       );
@@ -744,7 +927,9 @@ async function randomPokeLoop(ws, signal) {
       userLastPokeTime.set(selected.key, now);
     } catch (error) {
       if (signal.aborted) break;
-      console.error(`[QQ主动戳戳] 后台任务异常: ${error.name}: ${error.message}`);
+      console.error(
+        `[QQ主动戳戳] 后台任务异常: ${error.name}: ${error.message}`,
+      );
     }
   }
 
@@ -853,6 +1038,7 @@ async function handleQqWs() {
 
 async function handleQqEvent(ws, event) {
   const postType = event?.post_type;
+  const botName = getBotConfig().nickname;
 
   // ----- Notice 分支 -----
   if (postType === "notice") {
@@ -863,14 +1049,20 @@ async function handleQqEvent(ws, event) {
     const groupId = event.group_id;
     const selfId = event.self_id;
 
-    if (noticeType === "notify" && subType === "poke" && String(targetId) === String(selfId)) {
+    if (
+      noticeType === "notify" &&
+      subType === "poke" &&
+      String(targetId) === String(selfId)
+    ) {
       if (isBlacklisted(senderId)) return;
 
       console.log(`[QQ事件] 收到来自 ${senderId} 的戳一戳`);
 
       const isGroup = groupId !== null && groupId !== undefined;
       const targetReplyId = isGroup ? groupId : senderId;
-      const sessionId = isGroup ? `qq_${groupId}_${senderId}` : `qq_${senderId}`;
+      const sessionId = isGroup
+        ? `qq_${groupId}_${senderId}`
+        : `qq_${senderId}`;
       const isOwner = isOwnerQQ(senderId);
 
       const pokePrompt = isOwner
@@ -879,6 +1071,10 @@ async function handleQqEvent(ws, event) {
 
       const res = await coreProcessChat(sessionId, pokePrompt, undefined, {
         isOwner,
+        isGroup,
+        userId: String(senderId),
+        botId: String(selfId),
+        botName,
         searchText: null,
       });
 
@@ -905,7 +1101,7 @@ async function handleQqEvent(ws, event) {
   // 黑名单
   if (isBlacklisted(senderId)) return;
 
-  // 不处理机器人自己发出的消息（防止自己图片再次进入最近图片上下文）
+  // 机器人自己的消息也不禁止被用户引用；这里只避免机器人自我触发新的消息处理
   if (String(senderId) === String(selfId)) return;
 
   const isOwner = isOwnerQQ(senderId);
@@ -913,12 +1109,26 @@ async function handleQqEvent(ws, event) {
   // ----- 解析消息段 -----
   let userText = "";
   let imageContent = null;
+  let imageSourceUrl = null;
   let isMentioned = false;
   let isAtAll = false;
   let targetAvatarQq = null;
   let replyMessageId = null;
+  let quotedMessageContext = "";
+  let hasUnsupportedContent = false;
 
   const segments = Array.isArray(event.message) ? event.message : [];
+
+  if (Array.isArray(event.message)) {
+    console.log(
+      `[QQ收到] message=${messageId ?? "unknown"} | type=${messageType} | segments=${event.message.length} | raw=${JSON.stringify(String(event.raw_message || "").slice(0, 300))}`,
+    );
+  } else if (event.message) {
+    console.log(
+      `[QQ收到] message=${messageId ?? "unknown"} | type=${messageType} | message字段不是数组，使用原始内容兜底 | raw=${JSON.stringify(String(event.raw_message || event.message).slice(0, 300))}`,
+    );
+    userText = String(event.raw_message || event.message);
+  }
 
   for (const seg of segments) {
     if (!seg || typeof seg !== "object") continue;
@@ -936,15 +1146,17 @@ async function handleQqEvent(ws, event) {
       const imgUrl = segData.url || segData.file;
       if (imgUrl) {
         console.log("[QQ] 当前消息包含图片");
-        imageContent = await downloadImageAsBase64(imgUrl, 4000);
+        imageSourceUrl = segData.url || segData.file || null;
+        imageContent = await downloadImageReference(segData, 10000);
 
-        // 关键：图片到达即缓存，即使本条消息不会触发机器人回复
+        // 图片到达即缓存，即使本条消息不会触发机器人回复。
         if (imageContent) {
           saveRecentImageContext({
             isGroup,
             groupId,
             userId: senderId,
             imageContent,
+            sourceImageUrl: imageSourceUrl,
             messageId,
             messageTime,
           });
@@ -952,13 +1164,87 @@ async function handleQqEvent(ws, event) {
       }
     } else if (segType === "reply") {
       replyMessageId = segData.id;
+    } else if (segType === "face") {
+      const faceId = segData.id ?? "";
+      userText += faceId !== "" ? `[QQ表情:${faceId}]` : "[QQ表情]";
+      hasUnsupportedContent = true;
+    } else if (segType === "mface") {
+      const summary = segData.summary || segData.key || "QQ商城表情";
+      userText += `[QQ商城表情:${summary}]`;
+      hasUnsupportedContent = true;
+    } else if (segType === "dice") {
+      userText += `[骰子:${segData.result ?? "未知"}]`;
+      hasUnsupportedContent = true;
+    } else if (segType === "rps") {
+      userText += `[石头剪刀布:${segData.result ?? "未知"}]`;
+      hasUnsupportedContent = true;
+    } else if (segType === "record") {
+      userText += "[语音消息]";
+      hasUnsupportedContent = true;
+    } else if (segType === "video") {
+      userText += "[视频消息]";
+      hasUnsupportedContent = true;
+    } else if (segType === "file") {
+      userText += "[文件消息]";
+      hasUnsupportedContent = true;
+    } else if (segType === "forward") {
+      userText += "[转发消息]";
+      hasUnsupportedContent = true;
+    } else if (segType === "share") {
+      userText += segData.title ? `[分享:${segData.title}]` : "[链接分享]";
+      hasUnsupportedContent = true;
+    } else if (
+      segType === "json" ||
+      segType === "xml" ||
+      segType === "markdown" ||
+      segType === "card"
+    ) {
+      userText += `[特殊消息:${segType}]`;
+      hasUnsupportedContent = true;
+    } else if (segType) {
+      userText += `[${segType}消息]`;
+      hasUnsupportedContent = true;
     }
+  }
+
+  // 某些 NapCat/QQ 版本会新增特殊消息段。只要真的存在一个未被识别的非文本段，
+  // 也要留下一个明确标记，保证这条消息不会因为 userText 为空而被静默丢弃。
+  if (!userText.trim() && segments.length) {
+    const specialTypes = [
+      ...new Set(
+        segments
+          .map((seg) =>
+            seg && typeof seg === "object" ? String(seg.type || "") : "",
+          )
+          .filter(
+            (type) => type && !["text", "at", "image", "reply"].includes(type),
+          ),
+      ),
+    ];
+    if (specialTypes.length) {
+      userText = `[收到特殊QQ消息:${specialTypes.join(",")}]`;
+      hasUnsupportedContent = true;
+    }
+  }
+
+  // 某些 NapCat/QQ 版本会把表情类内容放进 raw_message，但 message 段无法正常解析。
+  // 至少保留“收到过一条特殊消息”的事实，不让它在这里被当成空消息直接丢弃。
+  if (!userText.trim() && event.raw_message) {
+    const raw = String(event.raw_message);
+    userText = raw.trim() || "[收到一条QQ特殊消息]";
+    hasUnsupportedContent = true;
   }
 
   // 全体 @ 忽略（图片缓存已在上方完成）
   if (isAtAll) return;
 
   userText = sanitizeInput(userText);
+
+  if (hasUnsupportedContent) {
+    console.log(
+      `[QQ收到] 特殊消息已转为上下文标记 | message=${messageId ?? "unknown"} | text=${userText.slice(0, 200)}`,
+    );
+  }
 
   // ----- 控制 / 公开指令 -----
   const controlCommand = handleControlCommand(userText, senderId);
@@ -983,7 +1269,12 @@ async function handleQqEvent(ws, event) {
       const rateLimit = checkServerStatusRateLimit(senderId);
       if (!rateLimit.allowed) {
         const seconds = Math.ceil(rateLimit.remainingMs / 1000);
-        await sendQqMsg(ws, targetId, isGroup, `服务器状态查得太频繁啦，${seconds} 秒后再查吧。`);
+        await sendQqMsg(
+          ws,
+          targetId,
+          isGroup,
+          `服务器状态查得太频繁啦，${seconds} 秒后再查吧。`,
+        );
         return;
       }
 
@@ -995,7 +1286,12 @@ async function handleQqEvent(ws, event) {
         await sendQqMsg(ws, targetId, isGroup, statusText);
       } catch (error) {
         console.error(`[服务器状态] 查询失败: ${error.name}: ${error.message}`);
-        await sendQqMsg(ws, targetId, isGroup, "唔……服务器状态接口暂时连不上了喵。");
+        await sendQqMsg(
+          ws,
+          targetId,
+          isGroup,
+          "唔……服务器状态接口暂时连不上了喵。",
+        );
       }
       return;
     }
@@ -1008,32 +1304,59 @@ async function handleQqEvent(ws, event) {
       `[系统提示：对方无权执行机器人控制指令「${controlCommand.command}」。` +
       "委婉拒绝请求，不要声称已执行。]";
 
-    const res = await coreProcessChat(sessionId, unauthorizedPrompt, undefined, {
-      isOwner: false,
-      searchText: null,
-    });
+    const res = await coreProcessChat(
+      sessionId,
+      unauthorizedPrompt,
+      undefined,
+      {
+        isOwner: false,
+        isGroup,
+        userId: String(senderId),
+        botId: String(selfId),
+        botName,
+        searchText: null,
+      },
+    );
 
-    if (res?.type === "text") await sendQqMsg(ws, targetId, isGroup, res.content);
+    if (res?.type === "text")
+      await sendQqMsg(ws, targetId, isGroup, res.content);
     return;
   }
 
   // ----- 记录最近活跃用户 -----
-  const userKey = isGroup ? `${groupId}_${String(senderId)}` : `private_${String(senderId)}`;
-  recentUsers.set(userKey, { groupId: isGroup ? groupId : null, userId: String(senderId) });
+  const userKey = isGroup
+    ? `${groupId}_${String(senderId)}`
+    : `private_${String(senderId)}`;
+  recentUsers.set(userKey, {
+    groupId: isGroup ? groupId : null,
+    userId: String(senderId),
+  });
 
   // ----- 用户要求拍自己 -----
   if (wantsPokeSelf(userText)) {
-    console.log(`[QQ戳戳] 用户主动要求拍自己: user_id=${senderId}, group_id=${groupId}`);
+    console.log(
+      `[QQ戳戳] 用户主动要求拍自己: user_id=${senderId}, group_id=${groupId}`,
+    );
     await sendQqPoke(ws, senderId, groupId);
     return;
   }
 
-  // ----- 引用消息：优先取引用消息中的图片 -----
-  if (replyMessageId && !imageContent) {
+  // ----- 引用消息：同时读取被引用的文字和图片 -----
+  if (replyMessageId) {
     const repliedMessage = await fetchQqMessage(replyMessageId);
     if (repliedMessage) {
-      const repliedImage = await extractImageFromMessage(repliedMessage, { selfId });
-      if (repliedImage) imageContent = repliedImage;
+      quotedMessageContext = buildQuotedMessageContext(repliedMessage, {
+        selfId,
+      });
+      const repliedImageSource = extractImageSourceFromMessage(repliedMessage);
+
+      if (!imageContent) {
+        const repliedImage = await extractImageFromMessage(repliedMessage);
+        if (repliedImage) {
+          imageContent = repliedImage;
+          imageSourceUrl = repliedImageSource;
+        }
+      }
     }
   }
 
@@ -1041,7 +1364,9 @@ async function handleQqEvent(ws, event) {
   if (isGroup) {
     const currentTime = Date.now() / 1000;
     const lastTalk = groupLastRandomTalk.get(String(groupId)) || 0;
-    const containsName = ["猫猫", "猫娘"].some((name) => userText.toLowerCase().includes(name));
+    const containsName = ["猫猫", "猫娘"].some((name) =>
+      userText.toLowerCase().includes(name),
+    );
 
     let shouldReply = false;
 
@@ -1067,13 +1392,17 @@ async function handleQqEvent(ws, event) {
   if (avatarKeywords.some((kw) => userText.includes(kw))) {
     if (userText.includes("我") || userText.includes("自己")) {
       targetAvatarQq = String(senderId);
-    } else if (!targetAvatarQq && (userText.includes("你") || userText.includes("猫娘"))) {
+    } else if (
+      !targetAvatarQq &&
+      (userText.includes("你") || userText.includes("猫娘"))
+    ) {
       targetAvatarQq = String(selfId);
     }
 
     if (targetAvatarQq && !imageContent && !isBlacklisted(targetAvatarQq)) {
       const avatarUrl = getUserAvatarUrl(targetAvatarQq);
       try {
+        imageSourceUrl = avatarUrl;
         imageContent = await downloadImageAsBase64(avatarUrl, 3000);
       } catch (error) {
         console.error(`[QQ] 头像下载失败: ${error.message}`);
@@ -1081,11 +1410,10 @@ async function handleQqEvent(ws, event) {
     }
   }
 
-  // ----- 最近图片视觉上下文（仅在本轮明显引用图片时才考虑） -----
-  // 这样仍保留“上一张图怎么样 / 帮我改一下刚才那张图”的能力，
-  // 但不会因为两分钟前发过一张图就把普通数学题也变成视觉任务。
+  // ----- 最近图片视觉上下文 -----
+  // 不再在本地判断“用户是不是在引用图片”。只要存在短期最近图片，就交给 AI 判断是否相关。
   let recentImageContext = null;
-  if (!imageContent && shouldUseRecentImageContext(userText)) {
+  if (!imageContent) {
     recentImageContext = getRecentImageContext({
       isGroup,
       groupId,
@@ -1095,16 +1423,17 @@ async function handleQqEvent(ws, event) {
 
     if (recentImageContext) {
       imageContent = recentImageContext.imageContent;
+      imageSourceUrl = recentImageContext.sourceImageUrl || null;
       console.log(
-        `[QQ图片] 使用最近图片上下文 | sender=${recentImageContext.senderId} | message_id=${
+        `[QQ图片] 提供最近图片候选视觉上下文 | sender=${recentImageContext.senderId} | message_id=${
           recentImageContext.messageId ?? "unknown"
         }`,
       );
     }
   }
 
-  // ----- 没有文字也没有图片 -----
-  if (!userText && !imageContent) {
+  // ----- 没有文字、图片或引用内容 -----
+  if (!userText && !imageContent && !quotedMessageContext) {
     if (isMentioned) {
       const emptyAtPrompt = isOwner
         ? "[事件] 主人@了你但未发言。亲切回应"
@@ -1112,10 +1441,15 @@ async function handleQqEvent(ws, event) {
 
       const res = await coreProcessChat(sessionId, emptyAtPrompt, undefined, {
         isOwner,
+        isGroup,
+        userId: String(senderId),
+        botId: String(selfId),
+        botName,
         searchText: null,
       });
 
-      if (res?.type === "text") await sendQqMsg(ws, targetId, isGroup, res.content);
+      if (res?.type === "text")
+        await sendQqMsg(ws, targetId, isGroup, res.content);
     }
     return;
   }
@@ -1123,13 +1457,13 @@ async function handleQqEvent(ws, event) {
   // ----- 群聊历史 -----
   let groupContextPrompt = "";
   if (isGroup) {
-    groupContextPrompt = await fetchGroupHistory(groupId, messageId);
+    groupContextPrompt = await fetchGroupHistory(groupId, messageId, selfId);
   }
 
   // ----- 构造 AI 上下文 -----
   const promptParts = [];
   if (groupContextPrompt) promptParts.push(groupContextPrompt);
-  if (replyMessageId) promptParts.push("\n[引用消息]\n");
+  if (quotedMessageContext) promptParts.push(`\n${quotedMessageContext}\n`);
 
   // 最近图片：只是候选视觉上下文，让模型自行判断是否使用
   if (recentImageContext && !replyMessageId) {
@@ -1140,7 +1474,9 @@ async function handleQqEvent(ws, event) {
 
   // 当前消息直接带图时，也约束一下，避免无关展开
   if (imageContent && !recentImageContext && !replyMessageId) {
-    promptParts.push("\n[当前图片：按当前输入判断是否需要分析，不要无关展开。]\n");
+    promptParts.push(
+      "\n[当前图片：按当前输入判断是否需要分析，不要无关展开。]\n",
+    );
   }
 
   if (userText) promptParts.push(userText);
@@ -1155,16 +1491,22 @@ async function handleQqEvent(ws, event) {
   );
 
   // ----- 调用 Core -----
+  const historyQuotePrefix = quotedMessageContext
+    ? `${quotedMessageContext}\n`
+    : "";
   const cleanUserHistoryEntry = imageContent
-    ? `[用户发送了一张图片]${userText ? `\n${userText}` : ""}`
-    : userText;
+    ? `${historyQuotePrefix}${recentImageContext ? "[本轮引用了最近图片上下文]" : "[当前用户发送了一张图片]"}${userText ? `\n${userText}` : ""}`
+    : `${historyQuotePrefix}${userText}`;
 
   const res = await coreProcessChat(sessionId, finalPrompt, imageContent, {
     isOwner,
     isGroup,
+    userId: String(senderId),
+    botId: String(selfId),
+    botName,
     searchText: userText,
     thinkingText: userText,
-    intentText: userText,
+    imageSourceUrl,
     historyTextEntry: cleanUserHistoryEntry,
 
     onThinkingStart: async () => {
@@ -1174,13 +1516,28 @@ async function handleQqEvent(ws, event) {
 
     onImageReady: async (image) => {
       console.log(`[QQ图片] Core 通知图片已完成 | session=${sessionId}`);
-      await sendQqMsg(ws, targetId, isGroup, "画好了喵", image.img_url, IMAGE_SOURCE.GENERATED);
+      await sendQqMsg(
+        ws,
+        targetId,
+        isGroup,
+        "画好了喵",
+        image.img_url,
+        IMAGE_SOURCE.GENERATED,
+      );
     },
 
     onImageError: async ({ sessionId: imageSessionId, error }) => {
-      console.error(`[QQ图片] 后台图片生成失败 | session=${imageSessionId}`, error);
+      console.error(
+        `[QQ图片] 后台图片生成失败 | session=${imageSessionId}`,
+        error,
+      );
       try {
-        await sendQqMsg(ws, targetId, isGroup, "唔……图片生成失败了，这次没画出来喵。");
+        await sendQqMsg(
+          ws,
+          targetId,
+          isGroup,
+          "唔……图片生成失败了，这次没画出来喵。",
+        );
       } catch (sendError) {
         console.error(`[QQ图片] 发送失败通知失败: ${sendError.message}`);
       }
@@ -1195,18 +1552,21 @@ async function handleQqEvent(ws, event) {
       if (!sent) console.error(`[QQ视频] 主动发送失败 | session=${sessionId}`);
     },
 
-    onVideoError: async ({ sessionId: videoSessionId, error }) => {
-      console.error(`[QQ视频] 后台视频生成失败 | session=${videoSessionId}`, error);
+    onVideoError: async ({ sessionId: videoSessionId, error, userMessage }) => {
+      console.error(
+        `[QQ视频] 后台视频生成失败 | session=${videoSessionId}`,
+        error,
+      );
       try {
-        await sendQqMsg(ws, targetId, isGroup, "唔……视频生成失败了，这次没生成出来喵。");
+        await sendQqMsg(
+          ws,
+          targetId,
+          isGroup,
+          userMessage || "视频服务刚刚出了点小状况，这次没生成出来喵。",
+        );
       } catch (sendError) {
         console.error(`[QQ视频] 发送失败通知失败: ${sendError.message}`);
       }
-    },
-
-    onMentionUser: async (userId) => {
-      if (!isGroup) return false;
-      return await sendQqMention(ws, groupId, userId);
     },
 
     onPokeUser: async (userId) => {
@@ -1216,17 +1576,49 @@ async function handleQqEvent(ws, event) {
 
   // ----- 输出处理 -----
   if (res?.type === "text") {
-    await sendAiTextMessages(ws, targetId, isGroup, res.content || "");
+    await sendAiTextMessages(
+      ws,
+      targetId,
+      isGroup,
+      res.content || "",
+      Array.isArray(res.mentionQqs) ? res.mentionQqs : [],
+    );
   } else if (res?.type === "video_pending") {
     const cleanContent = sanitizeOutput(res.content || "");
     console.log(
-      `[QQ视频] 视频任务已经提交后台生成 | ` + `video_id=${res.video_id} | ` + `task_id=${res.task_id}`,
+      `[QQ视频] 视频任务已经提交后台生成 | ` +
+        `video_id=${res.video_id} | ` +
+        `task_id=${res.task_id}`,
     );
-    if (cleanContent) await sendQqMsg(ws, targetId, isGroup, cleanContent);
+    if (cleanContent) {
+      await sendQqMsg(
+        ws,
+        targetId,
+        isGroup,
+        cleanContent,
+        null,
+        null,
+        Array.isArray(res.mentionQqs) ? res.mentionQqs : [],
+      );
+    } else if (Array.isArray(res.mentionQqs) && res.mentionQqs.length) {
+      await sendQqMsg(ws, targetId, isGroup, null, null, null, res.mentionQqs);
+    }
   } else if (res?.type === "image_pending") {
     const cleanContent = sanitizeOutput(res.content || "");
     console.log(`[QQ图片] 图片任务已经提交后台生成 | ` + `ratio=${res.ratio}`);
-    if (cleanContent) await sendQqMsg(ws, targetId, isGroup, cleanContent);
+    if (cleanContent) {
+      await sendQqMsg(
+        ws,
+        targetId,
+        isGroup,
+        cleanContent,
+        null,
+        null,
+        Array.isArray(res.mentionQqs) ? res.mentionQqs : [],
+      );
+    } else if (Array.isArray(res.mentionQqs) && res.mentionQqs.length) {
+      await sendQqMsg(ws, targetId, isGroup, null, null, null, res.mentionQqs);
+    }
   }
 }
 
@@ -1274,7 +1666,9 @@ export {
   messageSegmentsToText,
   downloadImageAsBase64,
   fetchQqMessage,
+  buildQuotedMessageContext,
   extractImageFromMessage,
+  extractImageSourceFromMessage,
   fetchGroupHistory,
   isOwnerQQ,
   isBlacklisted,

@@ -1,14 +1,26 @@
 version: "3.8"
+
 services:
   neko-bot:
     build: .
+
     container_name: neko_bot
+
     restart: unless-stopped
+
     network_mode: host
+
     working_dir: /app
+
     env_file:
       - .env
+
     volumes:
       - ./:/app
-      - /app/node_modules
+
+      - node_modules_data:/app/node_modules # 用具名卷隔离 protection
+
     command: ["node", "--enable-source-maps", "/app/main.js"]
+
+volumes:
+  node_modules_data:

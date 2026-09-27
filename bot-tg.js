@@ -77,7 +77,7 @@ async function chat(ctx) {
       // 先发送“正在画”的回复
       const statusMsg = await ctx.reply(res.cat_reply);
       // Markdown 代码格式显示提示词
-      const captionText = `画好了喵\n\`提示词：${res.prompt}\``;
+      const captionText = `好了喵\n\`提示词：${res.prompt}\``;
       // 删除之前的状态消息
       try {
         await ctx.api.deleteMessage(ctx.chat.id, statusMsg.message_id);
@@ -95,7 +95,7 @@ async function chat(ctx) {
       } catch {
         // Markdown 解析失败时纯文本回退
         await ctx.replyWithPhoto(res.img_url, {
-          caption: `画好了喵\n提示词：${res.prompt}`,
+          caption: `好了喵\n提示词：${res.prompt}`,
         });
       }
     }

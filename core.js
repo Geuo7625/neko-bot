@@ -11,6 +11,7 @@ import { createVisionMessage } from "./vision.js";
 import { generateImage } from "./image.js";
 import { createVideoTask, waitForVideo } from "./video.js";
 import { exaSearch } from "./exa.js";
+import { SAVE_MEMORY_TOOL, SEARCH_MEMORY_TOOL, FORGET_MEMORY_TOOL, formatMemorySearchResult, saveMemory, searchMemories, forgetMemory } from "./memory.js";
 
 
 // ============================================================
@@ -20,6 +21,7 @@ import { exaSearch } from "./exa.js";
 const TIMEZONE = "Asia/Shanghai";
 
 const VIDEO_CONTEXT_TTL = 60 * 60 * 1000;
+const IMAGE_CONTEXT_TTL = 60 * 60 * 1000;
 const MAX_VIDEO_CONTEXT_PROMPT_LEN = 4000;
 
 const DEFAULT_VIDEO_RATIO = "16:9";
@@ -30,137 +32,24 @@ const DEFAULT_VIDEO_FRAMES = 121;
 const VIDEO_RATIOS = ["1:1", "4:3", "3:4", "16:9", "9:16"];
 const IMAGE_RATIOS = ["1:1", "4:3", "3:4", "16:9", "9:16"];
 
-const MAX_TOOL_ROUNDS = 2;
+const MAX_TOOL_ROUNDS = 6;
+const MAX_MEMORY_WRITES_PER_REQUEST = 8;
+const MAX_MEMORY_SEARCHES_PER_REQUEST = 8;
 
-const THINKING_INTENT_PATTERN =
-  /思考|推理|推导|证明|论证|分析|深入分析|详细分析|reasoning|think|analyze/i;
+const THINKING_TRIGGER_PATTERN = /^(?:\/\+思考|\/\+推理|\/think)(?:\s+|$)/i;
 
 function shouldEnableThinking(text) {
-  if (!text || typeof text !== "string") {
-    return false;
-  }
-
-  const normalized = text.replace(/\s+/g, " ").trim().toLowerCase();
-
-  return THINKING_INTENT_PATTERN.test(normalized);
+  if (!text || typeof text !== "string") return false;
+  return THINKING_TRIGGER_PATTERN.test(text.replace(/\s+/g, " ").trim());
 }
 
-// ============================================================
-// 生成工具意图隔离
-//
-// 重要原则：
-// 1. 思考可以参考历史，但“是否允许生成图片/视频”只看本轮真实用户输入。
-// 2. 群聊历史、搜索结果、最近视频上下文、旧的图片请求都不能单独打开生成权限。
-// 3. 宁可让一次模糊的“帮我做一下”先不生成，也不要因为历史污染而误生成。
-// ============================================================
-
-const GENERATION_METHOD_PATTERN =
-  /怎么|如何|怎样|教程|方法|原理|什么是|是什么|为什么|参数|状态|进度|查询|介绍|能否说明|告诉我怎么|教我/i;
-
-const IMAGE_GENERATION_PATTERN = /(?:画(?:一张|一幅|一个|一只|个)?|绘制|生图|作图|(?:生成|制作|创作|设计|编辑|修改|重画|再画|修图|改图|重新生成)[^\n]{0,24}(?:图片|图像|插画|海报|壁纸|头像|表情包|封面|配图|图)|(?:图片|图像|插画|海报|壁纸|头像|表情包|封面|配图)[^\n]{0,24}(?:生成|制作|创作|设计|编辑|修改|重做|重画|重新生成))/i;
-
-const VIDEO_GENERATION_PATTERN = /(?:(?:生成|制作|创作|编辑|修改|重做|重制|继续|重新生成|做成|变成|来(?:一个|一段|个)?)\s*[^\n]{0,24}(?:视频|短片|动画|动图|片段)|(?:视频|短片|动画|动图|片段)[^\n]{0,24}(?:生成|制作|创作|编辑|修改|重做|重制|继续|重新生成))/i;
-
-const IMAGE_EDIT_WITH_ATTACHMENT_PATTERN =
-  /修改|编辑|重画|修图|改图|去掉|删除|增加|添加|换成|变成|重新生成|重做/i;
-
-const VIDEO_REFERENCE_PATTERN =
-  /刚才(?:那个|的)?视频|上一(?:个|段)?视频|上一个视频|这个视频|该视频|视频|短片|动画|动图|片段/i;
-
-function normalizeIntentText(text) {
-  return String(text || "")
-    .replace(/<thinking>[\s\S]*?<\/thinking>/gi, " ")
-    .replace(/\s+/g, " ")
-    .trim();
+function stripThinkingTrigger(text) {
+  if (!text || typeof text !== "string") return String(text || "");
+  return text.replace(THINKING_TRIGGER_PATTERN, "").trim();
 }
 
-function isMethodOrDiscussionRequest(text) {
-  return GENERATION_METHOD_PATTERN.test(normalizeIntentText(text));
-}
-
-function detectGenerationIntent(text, { hasImage = false, hasLastVideo = false } = {}) {
-  const normalized = normalizeIntentText(text);
-
-  if (!normalized) {
-    return { allowImage: false, allowVideo: false, reason: "empty" };
-  }
-
-  // “怎么生成视频 / 图片怎么做 / 视频教程”这类问题不属于生成动作。
-  // 但“帮我生成一个视频”“请画一张图”仍然可以正常通过。
-  const methodLike = isMethodOrDiscussionRequest(normalized);
-  const directGenerationCue =
-    /(?:帮我|请|给我|直接|现在|马上|就|来一个|来个|做一个|做一张|做一幅)/i.test(
-      normalized,
-    );
-
-  const desireGenerationCue =
-    /(?:我要|我想要|想要|来一个|来个|给我一个|给我一张|给我一幅)/i.test(normalized);
-
-  let allowImage = IMAGE_GENERATION_PATTERN.test(normalized);
-  let allowVideo = VIDEO_GENERATION_PATTERN.test(normalized);
-
-  // 当前消息本身带图片时，“帮我修改一下/把它换成……”属于图片编辑。
-  if (hasImage && IMAGE_EDIT_WITH_ATTACHMENT_PATTERN.test(normalized)) {
-    allowImage = true;
-  }
-
-  // 上一段视频只能在本轮明确提到视频/视频上下文并提出操作时继续使用。
-  if (hasLastVideo && VIDEO_REFERENCE_PATTERN.test(normalized)) {
-    if (/(修改|编辑|重做|重制|继续|重新生成|延续|改成|变成|再做|再生成)/i.test(normalized)) {
-      allowVideo = true;
-    }
-  }
-
-  // 对“生成/制作/做一个视频”这类非常明确的直接请求给一个额外容错，
-  // 但仍要求出现视频对象，避免普通“生成一个答案/总结”打开视频权限。
-  if (
-    directGenerationCue &&
-    /视频|短片|动画|动图|片段/i.test(normalized) &&
-    /(生成|制作|创作|编辑|修改|重做|重制|继续|再做|再生成|做成|变成|来一个|来个|做一个|我想要|我要)/i.test(
-      normalized,
-    )
-  ) {
-    allowVideo = true;
-  }
-
-  // 对图片同样增加容错，但“生成一个数学答案”不会因为这里而打开图片工具。
-  if (
-    directGenerationCue &&
-    /图片|图像|插画|海报|壁纸|头像|表情包|封面|配图/i.test(normalized) &&
-    /(生成|制作|创作|设计|编辑|修改|重做|重画|再画|做成|变成|来一张|来一幅|做一张|做一幅|画)/i.test(
-      normalized,
-    )
-  ) {
-    allowImage = true;
-  }
-
-  // 典型“怎么/如何/教程/原理”问题不执行生成动作。
-  // 但“分析这张图，然后生成一张新图”属于真实生成请求，不应被“分析”本身拦截。
-  if (methodLike && !directGenerationCue && !desireGenerationCue) {
-    // 只有当用户是在问生成方法，而不是直接下达生成/编辑动作时才拦截。
-    const asksHowToGenerate =
-      /(?:怎么|如何|怎样|教程|方法|原理|什么是|是什么|为什么|能否说明|告诉我怎么|教我)[^\n]{0,24}(?:生成|制作|画|绘制|图片|图像|视频|短片|动画)/i.test(
-        normalized,
-      );
-
-    if (asksHowToGenerate || !allowImage && !allowVideo) {
-      allowImage = false;
-      allowVideo = false;
-    }
-  }
-
-  // “我要一个视频 / 我想要一张图”属于直接需求，而不是教程问题。
-  if (!methodLike && desireGenerationCue) {
-    if (/视频|短片|动画|动图|片段/i.test(normalized)) allowVideo = true;
-    if (/图片|图像|插画|海报|壁纸|头像|表情包|封面|配图|图/i.test(normalized)) allowImage = true;
-  }
-
-  return {
-    allowImage,
-    allowVideo,
-    reason: `image=${allowImage},video=${allowVideo}`,
-  };
-}
+// 图片/视频是否需要生成不再由本地关键词正则决定。
+// 模型通过 Tool Calling 自己判断：普通视觉理解、新图生成、还是已有图片编辑。
 
 // API 流式请求：只限制首个 SSE 数据块的等待时间
 const AGNES_FIRST_CHUNK_TIMEOUT = 60000;
@@ -170,6 +59,10 @@ const AGNES_FIRST_CHUNK_TIMEOUT = 60000;
 // ============================================================
 
 const TOOLS = [
+  SAVE_MEMORY_TOOL,
+  SEARCH_MEMORY_TOOL,
+  FORGET_MEMORY_TOOL,
+
   {
     type: "function",
     function: {
@@ -201,7 +94,7 @@ const TOOLS = [
     function: {
       name: "mention_user",
       description:
-        "在 QQ 群中真实 @ 用户。仅需执行 @ 时调用；user_id 必须来自当前群聊历史，@全体成员用 all。不要用普通文字代替。",
+        "在 QQ 群中真实 @ 用户；需要 @ 时必须调用，不要在正文手写 @QQ号。user_id 必须来自当前上下文，@全体成员用 all。多个目标可多次调用。",
       parameters: {
         type: "object",
         properties: {
@@ -241,14 +134,14 @@ const TOOLS = [
     function: {
       name: "generate_image",
       description:
-        "生成图片。仅当结合上下文确认用户要操作图片时调用；讨论、评价或询问时不要调用。prompt 用完整英文提示词；start_message 用简短中文说明已开始生成。",
+        "图片工具。由模型自行判断用户是在理解图片、生成新图还是修改已有图片；只有真正需要生成/修改图片时才调用。修改已有图片时使用 mode=edit，并选择 source=current（当前/引用图片）或 source=last_generated（最近一次机器人生成的图片）。prompt 用完整英文提示词；start_message 用简短中文说明已开始生成。",
       parameters: {
         type: "object",
         properties: {
           prompt: {
             type: "string",
             description:
-              "完整英文图片提示词，描述主体、动作、环境、构图、光线和风格。",
+              "完整英文图片提示词，描述主体、动作、环境、构图、光线和风格；编辑模式重点描述需要修改的内容，并保留用户未要求变化的部分。",
           },
           start_message: {
             type: "string",
@@ -259,8 +152,18 @@ const TOOLS = [
             enum: IMAGE_RATIOS,
             description: "图片比例；用户指定则按用户要求，否则 4:3。",
           },
+          mode: {
+            type: "string",
+            enum: ["new", "edit"],
+            description: "new=生成全新图片；edit=图生图修改已有图片。",
+          },
+          source: {
+            type: "string",
+            enum: ["current", "last_generated"],
+            description: "仅 edit 模式使用。current=当前消息/引用中的图片；last_generated=最近一次机器人生成并发送的图片。",
+          },
         },
-        required: ["prompt", "start_message"],
+        required: ["prompt", "start_message", "mode"],
         additionalProperties: false,
       },
     },
@@ -332,17 +235,42 @@ function getHistory(sessionId) {
     userHistories.set(sessionId, []);
   }
 
-  return userHistories.get(sessionId);
+  return sanitizeHistoryMessages(userHistories.get(sessionId));
 }
 
 function getSessionState(sessionId) {
   if (!sessionStates.has(sessionId)) {
     sessionStates.set(sessionId, {
       lastVideo: null,
+      lastImage: null,
     });
+  } else {
+    const state = sessionStates.get(sessionId);
+    if (!Object.prototype.hasOwnProperty.call(state, "lastImage")) {
+      state.lastImage = null;
+    }
   }
 
   return sessionStates.get(sessionId);
+}
+
+function getLastImage(sessionId) {
+  const state = getSessionState(sessionId);
+  const image = state.lastImage;
+
+  if (!image) return null;
+
+  const referenceTime = image.completedAt || image.createdAt || Date.now();
+  if (Date.now() - referenceTime > IMAGE_CONTEXT_TTL) {
+    state.lastImage = null;
+    return null;
+  }
+
+  return image;
+}
+
+function setLastImage(sessionId, image) {
+  getSessionState(sessionId).lastImage = image;
 }
 
 // ============================================================
@@ -487,6 +415,29 @@ function normalizeVideoFps(fps) {
 // 回复清理
 // ============================================================
 
+function normalizeHistoryText(text) {
+  if (text === null || text === undefined) return "";
+
+  return String(text)
+    .replace(/\r\n?|\n/g, " ")
+    .replace(/[ \t]+/g, " ")
+    .trim();
+}
+
+function sanitizeHistoryMessages(history) {
+  if (!Array.isArray(history)) return history;
+
+  for (const message of history) {
+    if (!message || typeof message !== "object") continue;
+
+    if (typeof message.content === "string") {
+      message.content = normalizeHistoryText(message.content);
+    }
+  }
+
+  return history;
+}
+
 function cleanModelReply(text) {
   if (text === null || text === undefined) {
     return "";
@@ -518,6 +469,8 @@ function stripThinkingContent(text) {
 // ============================================================
 
 function trimHistory(sessionId, history) {
+  sanitizeHistoryMessages(history);
+
   if (history.length <= MAX_HISTORY_LEN) {
     return;
   }
@@ -642,6 +595,8 @@ async function processVideoInBackground({
           type: "video_error",
           sessionId,
           error,
+          rateLimited: isRateLimitError(error),
+          userMessage: getVideoErrorMessage(error),
         });
       } catch (callbackError) {
         console.error(
@@ -664,13 +619,18 @@ async function processImageInBackground({
   prompt,
   ratio,
   reply,
+  mode = "new",
+  sourceImageUrl = null,
   onImageReady,
   onImageError,
 }) {
   try {
     console.log(`[Core] 等待图片 | session=${sessionId} | ratio=${ratio}`);
 
-    const imgUrl = await generateImage(prompt, ratio);
+    const imgUrl = await generateImage(prompt, ratio, {
+      mode,
+      sourceImageUrl,
+    });
 
     const image = {
       type: "draw",
@@ -679,8 +639,12 @@ async function processImageInBackground({
       img_url: imgUrl,
       prompt,
       ratio,
+      mode,
+      sourceImageUrl: mode === "edit_last" ? sourceImageUrl : null,
       completedAt: Date.now(),
     };
+
+    setLastImage(sessionId, image);
 
     console.log(`[Core] 图片完成 | session=${sessionId} | ratio=${ratio}`);
 
@@ -727,6 +691,8 @@ function executeImageTool({
   history,
   historyTextEntry,
   args,
+  imageSourceUrl = null,
+  lastImage = null,
   onImageReady,
   onImageError,
 }) {
@@ -755,48 +721,147 @@ function executeImageTool({
   }
 
   const ratio = normalizeImageRatio(args.ratio);
+  const mode = args?.mode === "edit" ? "edit_last" : "new";
 
-  // ==========================================================
-  // 先立即写入历史
-  // 这里只保存用户要求 + AI 的开始提示
-  // 不保存图片 URL
-  // ==========================================================
+  let sourceImage = null;
+  if (mode === "edit_last") {
+    if (args?.source === "last_generated") {
+      sourceImage = lastImage?.img_url || null;
+    } else {
+      sourceImage = imageSourceUrl || null;
+    }
+
+    if (!sourceImage) {
+      return {
+        type: "text",
+        content: "唔……我知道你是在修改已有图片，但当前没有可用的原图。请把那张图再发一次或引用它。",
+      };
+    }
+  }
 
   history.push({
     role: "user",
-    content: historyTextEntry,
+    content: normalizeHistoryText(historyTextEntry),
   });
 
   history.push({
     role: "assistant",
-    content: reply,
+    content: normalizeHistoryText(reply),
   });
 
   trimHistory(sessionId, history);
-
-  // ==========================================================
-  // 后台生成图片
-  // ==========================================================
 
   void processImageInBackground({
     sessionId,
     prompt,
     ratio,
     reply,
+    mode,
+    sourceImageUrl: sourceImage,
     onImageReady,
     onImageError,
   });
-
-  // ==========================================================
-  // 立即返回
-  // ==========================================================
 
   return {
     type: "image_pending",
     content: reply,
     prompt,
     ratio,
+    mode,
   };
+}
+
+function getHttpStatus(error) {
+  const candidates = [
+    error?.response?.status,
+    error?.status,
+    error?.statusCode,
+    error?.response?.data?.http_status,
+  ];
+
+  for (const candidate of candidates) {
+    const value = Number(candidate);
+    if (Number.isInteger(value) && value >= 100 && value <= 599) {
+      return value;
+    }
+  }
+
+  const message = String(error?.message || error?.response?.data?.message || "");
+  const match = message.match(/\b(?:HTTP|status|code)[\s:=_-]*(\d{3})\b/i);
+  if (match) {
+    const value = Number(match[1]);
+    if (value >= 100 && value <= 599) return value;
+  }
+
+  return null;
+}
+
+function isRateLimitError(error) {
+  const status = getHttpStatus(error);
+  if (Number(status) === 429) return true;
+
+  const message = String(error?.message || error?.response?.data?.message || "");
+  return /\b429\b|too many requests|rate.?limit/i.test(message);
+}
+
+function getChatErrorMessage(error) {
+  const status = getHttpStatus(error);
+
+  if (status === 429) {
+    return "慢点…我有点跟不上了";
+  }
+
+  if (status === 500 || status === 502 || status === 503 || status === 504) {
+    return "刚才没接上…";
+  }
+
+  if (
+    error?.code === "AGNES_FIRST_CHUNK_TIMEOUT" ||
+    error?.code === "ECONNABORTED" ||
+    error?.code === "ETIMEDOUT"
+  ) {
+    return "我等太久了…";
+  }
+
+  if (status && status >= 400) {
+    return "好像出了点问题…";
+  }
+
+  if (error?.request && !error?.response) {
+    return "刚才没收到回应…";
+  }
+
+  return "出错了…";
+}
+
+function getVideoErrorMessage(error) {
+  const status = getHttpStatus(error);
+
+  if (status === 401 || status === 403 || status === 503) {
+    return "现在人有点多…视频用不了";
+  }
+
+  if (status === 429) {
+    return "有点忙…视频跟不上了";
+  }
+
+  if (status === 500 || status === 502 || status === 504) {
+    return "刚才没接上…视频没出来";
+  }
+
+  if (error?.code === "ECONNABORTED" || error?.code === "ETIMEDOUT") {
+    return "视频等太久了…";
+  }
+
+  if (status && status >= 400) {
+    return "视频好像出了点问题…";
+  }
+
+  if (error?.request && !error?.response) {
+    return "视频那边没回应…";
+  }
+
+  return "视频好像出了点问题…";
 }
 
 // ============================================================
@@ -887,12 +952,12 @@ async function executeVideoTool({
 
     history.push({
       role: "user",
-      content: historyTextEntry,
+      content: normalizeHistoryText(historyTextEntry),
     });
 
     history.push({
       role: "assistant",
-      content: reply,
+      content: normalizeHistoryText(reply),
     });
 
     trimHistory(sessionId, history);
@@ -925,7 +990,7 @@ async function executeVideoTool({
 
     return {
       type: "text",
-      content: "唔……视频任务好像没创建成功，这次先没法生成了。",
+      content: getVideoErrorMessage(error),
     };
   }
 }
@@ -934,11 +999,11 @@ async function executeVideoTool({
 // @ 用户 Tool
 // ============================================================
 
-async function executeMentionTool({ args, isGroup, onMentionUser }) {
+function executeMentionTool({ args, isGroup }) {
   if (!isGroup) {
     return {
       ok: false,
-      content: "当前是私聊，没有群聊 @ 功能，因此没有发送 @。",
+      content: "当前是私聊，没有群聊 @ 功能。",
     };
   }
 
@@ -947,46 +1012,22 @@ async function executeMentionTool({ args, isGroup, onMentionUser }) {
   if (!userId) {
     return {
       ok: false,
-      content: "没有提供有效的 QQ 号，因此没有发送 @。",
+      content: "没有提供有效的 QQ 号。",
     };
   }
 
   if (userId !== "all" && !/^\d{5,12}$/.test(userId)) {
     return {
       ok: false,
-      content: "提供的 QQ 号格式无效，因此没有发送 @。",
+      content: "QQ 号格式无效。",
     };
   }
 
-  if (typeof onMentionUser !== "function") {
-    return {
-      ok: false,
-      content: "当前 QQ 连接没有提供 @ 功能。",
-    };
-  }
-
-  try {
-    const result = await onMentionUser(userId);
-
-    if (result) {
-      return {
-        ok: true,
-        content: `已通过 QQ 接口发送真实 @：${userId}`,
-      };
-    }
-
-    return {
-      ok: false,
-      content: "QQ @ 操作没有成功发送。",
-    };
-  } catch (error) {
-    console.error("[Core] @ 用户失败:", error);
-
-    return {
-      ok: false,
-      content: "QQ @ 操作失败：" + error.message,
-    };
-  }
+  return {
+    ok: true,
+    userId,
+    content: `已记录真实 @：${userId}。最终回复会与正文一起发送。`,
+  };
 }
 
 // ============================================================
@@ -1446,10 +1487,12 @@ async function coreProcessChat(
   const {
     isOwner = false,
     isGroup = false,
+    userId = null,
+    botId = null,
+    botName = "QQ机器人",
     searchText = null,
 
-    // 本轮“真正的用户输入”，不要使用包含群历史/系统提示的 finalPrompt。
-    intentText = null,
+    imageSourceUrl = null,
     suppliedHistoryTextEntry = null,
 
     thinkingText = null,
@@ -1462,7 +1505,6 @@ async function coreProcessChat(
     onVideoReady = null,
     onVideoError = null,
 
-    onMentionUser = null,
     onPokeUser = null,
   } = options;
 
@@ -1473,21 +1515,15 @@ async function coreProcessChat(
   // ==========================================================
 
   const actualThinkingText = thinkingText !== null ? thinkingText : userText;
-  const actualIntentText = intentText !== null ? intentText : actualThinkingText;
+  const modelUserText = stripThinkingTrigger(userText);
 
   const thinkingEnabled = shouldEnableThinking(actualThinkingText);
 
-  const generationIntent = detectGenerationIntent(actualIntentText, {
-    hasImage: Boolean(imageContent),
-    hasLastVideo: Boolean(getLastVideo(sessionId)),
-  });
-
-  // 历史只作为上下文，不成为本轮生成权限的来源。
-  const effectiveHistoryTextEntry =
-  suppliedHistoryTextEntry !== null &&
-  suppliedHistoryTextEntry !== undefined
-    ? String(suppliedHistoryTextEntry)
-    : String(userText || "");
+  const effectiveHistoryTextEntry = normalizeHistoryText(
+    suppliedHistoryTextEntry !== null && suppliedHistoryTextEntry !== undefined
+      ? suppliedHistoryTextEntry
+      : userText || "",
+  );
 
   let totalThinkingDurationMs = 0;
 
@@ -1504,6 +1540,12 @@ async function coreProcessChat(
   // ==========================================================
 
   let webSearchUsed = false;
+  // 单次用户请求最多执行若干次记忆写入，允许一条消息同时抽取多个稳定事实。
+  let memoryWriteCount = 0;
+  let memorySearchCount = 0;
+  let memorySearchPerformed = false;
+  // 本轮所有真实 @ 请求，等最终文本确定后一次性组成 QQ 消息链发送。
+  const pendingMentionQqs = [];
 
   // 当前请求级工具状态，不进入 history，不跨对话共享
   const toolState = {
@@ -1529,12 +1571,8 @@ async function coreProcessChat(
       `text=${String(actualThinkingText || "").slice(0, 100)}`,
   );
 
-  console.log(
-    `[Core] 生成权限判断 | ${generationIntent.reason} | ` +
-      `intent=${normalizeIntentText(actualIntentText).slice(0, 120)}`,
-  );
-
   const lastVideo = getLastVideo(sessionId);
+  const lastImage = getLastImage(sessionId);
 
   const currentTime = getCurrentTime();
 
@@ -1545,16 +1583,73 @@ async function coreProcessChat(
   let currentUserMessageContent;
   let historyTextEntry;
 
+  const visionSources = [];
   if (imageContent) {
-    const visionMessage = createVisionMessage(imageContent, userText);
+    visionSources.push({
+      label: "【当前/引用图片】",
+      image: imageContent,
+      source: imageSourceUrl || null,
+    });
+  }
 
-    currentUserMessageContent = visionMessage.content;
+  if (lastImage?.img_url) {
+    const isSameAsCurrent =
+      imageSourceUrl && String(imageSourceUrl) === String(lastImage.img_url);
 
-    historyTextEntry = visionMessage.historyText;
+    if (!isSameAsCurrent) {
+      visionSources.push({
+        label: "【最近一次机器人生成的图片，仅作为可引用的视觉上下文】",
+        image: lastImage.img_url,
+        source: lastImage.img_url,
+      });
+    }
+  }
+
+  if (visionSources.length) {
+    const primary = visionSources[0];
+    const primaryVision = createVisionMessage(
+      primary.image,
+      visionSources.length > 1
+        ? `${primary.label}\n${userText || ""}`
+        : userText,
+    );
+
+    const contentParts = Array.isArray(primaryVision.content)
+      ? [...primaryVision.content]
+      : [{ type: "text", text: String(primaryVision.content || "") }];
+
+    if (!contentParts.some((part) => part?.type === "image_url")) {
+      contentParts.push({
+        type: "image_url",
+        image_url: { url: String(primary.image) },
+      });
+    }
+
+    for (const extra of visionSources.slice(1)) {
+      const extraVision = createVisionMessage(extra.image, "");
+      contentParts.push({ type: "text", text: extra.label });
+      let addedImage = false;
+      if (Array.isArray(extraVision.content)) {
+        for (const part of extraVision.content) {
+          if (part?.type === "image_url") {
+            contentParts.push(part);
+            addedImage = true;
+          }
+        }
+      }
+      if (!addedImage) {
+        contentParts.push({
+          type: "image_url",
+          image_url: { url: String(extra.image) },
+        });
+      }
+    }
+
+    currentUserMessageContent = contentParts;
+    historyTextEntry = primaryVision.historyText;
   } else {
-    currentUserMessageContent = userText;
-
-    historyTextEntry = userText;
+    currentUserMessageContent = modelUserText;
+    historyTextEntry = modelUserText;
   }
 
   // ==========================================================
@@ -1563,7 +1658,9 @@ async function coreProcessChat(
 
   let searchInfo = null;
 
-  const actualSearchText = searchText !== null ? searchText : userText;
+  const actualSearchText = stripThinkingTrigger(
+    searchText !== null ? searchText : userText,
+  );
 
   if (actualSearchText) {
     try {
@@ -1582,27 +1679,36 @@ async function coreProcessChat(
     `
 【当前时间】${currentTime}`;
 
+  systemContent += `
+【你】你是这个 QQ 机器人本身${botName ? `，名称是“${String(botName).slice(0, 40)}”` : ""}${botId ? `，QQ号是 ${String(botId)}` : ""}。消息中的 role=assistant 是你的历史发言；群聊历史里标为“你（机器人）”的是你自己，不要把自己当成普通群友。需要 @ 用户时只调用 mention_user，不要在正文里手写 @QQ号。
+`;
+
   systemContent += isOwner
-    ? "\n【身份】当前用户是主人，可称其为主人。"
-    : "\n【身份】当前用户不是主人，不要称其为主人。";
+    ? "【身份】当前用户是主人，可称其为主人。"
+    : "【身份】当前用户不是主人，不要称其为主人。";
 
   systemContent += `
 【工具】
-按需调用工具；真实 QQ 动作必须通过工具执行。
-不要把工具调用或参数写成普通文本。
+按需调用工具；不要把工具调用写成普通文本。
+【记忆】
+需要过去信息先 search_memory；保存前也先查并复用已有 key。只保存用户明确说出的信息，不补充、推断或猜测；用户修改时改原记忆。敏感信息不要保存。忘记用 forget_memory；引用较早记忆说“之前/以前”。
+【思考】
+只有用户消息以 /+思考、/+推理 或 /think 开头时才开启，否则不要开启。
 `;
-
-  // 最近视频只有在本轮明确提到视频时才注入。
-  // “视频怎么生成/视频状态”可以继续看到视频上下文，但不会因此获得生成权限。
-  if (lastVideo && VIDEO_REFERENCE_PATTERN.test(normalizeIntentText(actualIntentText))) {
+  if (lastVideo) {
     systemContent += "\n\n" + buildLastVideoContext(lastVideo);
   }
 
   systemContent += `
-【生成工具隔离】
-图片/视频生成工具的可用性只由本轮真实用户输入决定。历史对话、群聊历史、搜索结果、旧的图片/视频请求都不能单独触发生成。即使历史里刚刚生成过图片或视频，只要本轮没有明确要求生成/修改对应媒体，就不要尝试调用生成工具。
-本轮图片工具：${generationIntent.allowImage ? "可用" : "不可用"}
-本轮视频工具：${generationIntent.allowVideo ? "可用" : "不可用"}
+【媒体工具判断】
+不要依赖关键词或本地正则判断用户是否要生图。工具始终可用，你自己根据当前用户消息、当前/引用图片以及最近生成图片的视觉上下文判断：
+- 只是询问、分析、描述或评价图片时，不调用 generate_image。
+- 用户要求生成一张新图片时，调用 generate_image，mode=new。
+- 用户要求修改、重画、继续调整已有图片时，调用 generate_image，mode=edit。
+- mode=edit 且用户要改当前发送/引用的图片时，source=current。
+- mode=edit 且用户明确要修改你刚才生成的图片时，source=last_generated。
+- 当多个图片上下文同时存在时，根据用户描述选择真正要修改的那一张；不要把图片的存在本身理解为生成请求。
+- 不要因为“看到了图片”就自动生图，必须先判断用户是否真的要求生成/编辑。
 `;
 
   // ==========================================================
@@ -1654,12 +1760,16 @@ ${searchInfo}`,
         return !webSearchUsed;
       }
 
-      if (name === "generate_image") {
-        return generationIntent.allowImage;
+      if (name === "save_memory") {
+        return Boolean(userId) && memoryWriteCount < MAX_MEMORY_WRITES_PER_REQUEST;
       }
 
-      if (name === "generate_video") {
-        return generationIntent.allowVideo;
+      if (name === "search_memory") {
+        return Boolean(userId) && memorySearchCount < MAX_MEMORY_SEARCHES_PER_REQUEST;
+      }
+
+      if (name === "forget_memory") {
+        return Boolean(userId);
       }
 
       return true;
@@ -1754,7 +1864,7 @@ ${searchInfo}`,
 
       return {
         type: "text",
-        content: "唔……刚才脑袋卡住了一下，等我再试试看喵。",
+        content: getChatErrorMessage(error),
       };
     }
 
@@ -1765,7 +1875,7 @@ ${searchInfo}`,
 
       return {
         type: "text",
-        content: "唔……我刚才好像没听懂服务器在说什么喵。",
+        content: "刚才没接上…",
       };
     }
 
@@ -1787,10 +1897,16 @@ ${searchInfo}`,
       }
 
       if (!replyText) {
-        return {
-          type: "text",
-          content: "唔……我刚才突然不知道说什么了喵。",
-        };
+        if (toolRound < MAX_TOOL_ROUNDS - 1) {
+          workingMessages.push({
+            role: "system",
+            content:
+              "刚才的工具调用没有产生需要展示给用户的文本。现在直接回答当前用户最后一条消息，不要再解释工具过程。",
+          });
+          continue;
+        }
+
+        replyText = "刚才没接上…";
       }
 
       history.push({
@@ -1800,7 +1916,7 @@ ${searchInfo}`,
 
       history.push({
         role: "assistant",
-        content: replyText,
+        content: normalizeHistoryText(replyText),
       });
 
       trimHistory(sessionId, history);
@@ -1844,6 +1960,13 @@ ${searchInfo}`,
         continue;
       }
 
+      // 单个用户请求最多执行 MAX_MEMORY_WRITES_PER_REQUEST 次记忆写入。
+      // 多余的 save_memory 调用不进入上下文，防止模型一次生成过多重复写入。
+      if (name === "save_memory" && filteredToolCalls.filter((item) => item?.function?.name === "save_memory").length >= (MAX_MEMORY_WRITES_PER_REQUEST - memoryWriteCount)) {
+        console.warn(`[Core] 跳过超额 save_memory | id=${toolCall?.id || "unknown"}`);
+        continue;
+      }
+
       filteredToolCalls.push(toolCall);
     }
 
@@ -1883,10 +2006,16 @@ ${searchInfo}`,
       }
 
       if (!replyText) {
-        return {
-          type: "text",
-          content: "唔……我刚才突然不知道说什么了喵。",
-        };
+        if (toolRound < MAX_TOOL_ROUNDS - 1) {
+          workingMessages.push({
+            role: "system",
+            content:
+              "刚才的工具调用没有产生需要展示给用户的文本。现在直接回答当前用户最后一条消息，不要再解释工具过程。",
+          });
+          continue;
+        }
+
+        replyText = "刚才没接上…";
       }
 
       history.push({
@@ -1896,7 +2025,7 @@ ${searchInfo}`,
 
       history.push({
         role: "assistant",
-        content: replyText,
+        content: normalizeHistoryText(replyText),
       });
 
       trimHistory(sessionId, history);
@@ -1929,9 +2058,21 @@ ${searchInfo}`,
         toolCall.id || `${name || "unknown"}_${Date.now()}`,
       );
 
+      const safeToolArguments =
+        name === "save_memory"
+          ? {
+              operation: args?.operation,
+              key: args?.key,
+              category: args?.category,
+              entity: args?.entity,
+              hasValue: Boolean(args?.value),
+              valueLength: typeof args?.value === "string" ? args.value.length : 0,
+            }
+          : args;
+
       console.log("[Core] Tool Call:", {
         name,
-        arguments: args,
+        arguments: safeToolArguments,
         toolCallId,
       });
 
@@ -2002,11 +2143,14 @@ ${searchInfo}`,
       // ======================================================
 
       if (name === "mention_user") {
-        const result = await executeMentionTool({
+        const result = executeMentionTool({
           args,
           isGroup,
-          onMentionUser,
         });
+
+        if (result.ok && result.userId) {
+          pendingMentionQqs.push(String(result.userId));
+        }
 
         workingMessages.push({
           role: "tool",
@@ -2043,30 +2187,145 @@ ${searchInfo}`,
       }
 
       // ======================================================
-      // generate_image
+      // search_memory
       // ======================================================
 
-      if (name === "generate_image") {
-        if (!generationIntent.allowImage) {
-          console.warn("[Core] 拒绝非本轮意图触发的图片生成 Tool Call");
+      if (name === "search_memory") {
+        if (!userId) {
           workingMessages.push({
             role: "tool",
             tool_call_id: toolCallId,
-            name: "generate_image",
-            content: "本轮用户没有明确要求生成或修改图片，因此本次图片生成调用被拦截。请直接回答当前问题。",
+            name: "search_memory",
+            content: "当前请求没有有效的 QQ 用户 UID，因此无法查询长期记忆。",
           });
           needContinue = true;
           continue;
         }
 
-        return executeImageTool({
+        const query = typeof args?.query === "string" ? args.query.trim() : "";
+        const scope = ["active", "history", "both"].includes(args?.scope)
+          ? args.scope
+          : "active";
+        const mode = ["relevant", "topic"].includes(args?.mode)
+          ? args.mode
+          : "relevant";
+        const entity = typeof args?.entity === "string" ? args.entity.trim() : "";
+
+        memorySearchCount++;
+
+        if (!query) {
+          workingMessages.push({
+            role: "tool",
+            tool_call_id: toolCallId,
+            name: "search_memory",
+            content: "查询失败：没有提供需要检索的内容。",
+          });
+          needContinue = true;
+          continue;
+        }
+
+        const rows = await searchMemories(userId, query, { scope, mode, entity });
+        memorySearchPerformed = true;
+        const resultText = formatMemorySearchResult(rows, scope);
+
+        console.log(
+          `[Core] search_memory 完成 | uid=${String(userId)} | scope=${scope} | mode=${mode} | hits=${rows.length} | searches=${memorySearchCount}/${MAX_MEMORY_SEARCHES_PER_REQUEST}`,
+        );
+
+        workingMessages.push({
+          role: "tool",
+          tool_call_id: toolCallId,
+          name: "search_memory",
+          content: resultText,
+        });
+
+        needContinue = true;
+        continue;
+      }
+
+      // ======================================================
+      // forget_memory
+      // ======================================================
+
+      if (name === "forget_memory") {
+        if (!userId) {
+          workingMessages.push({ role: "tool", tool_call_id: toolCallId, name: "forget_memory", content: "当前请求没有有效的 QQ 用户 UID。" });
+          needContinue = true;
+          continue;
+        }
+
+        const result = await forgetMemory(userId, args);
+        workingMessages.push({ role: "tool", tool_call_id: toolCallId, name: "forget_memory", content: result.content });
+        console.log(`[Core] forget_memory 完成 | uid=${String(userId)} | key=${String(result.matchedKey || args?.key || "").slice(0, 80)} | saved=${Boolean(result.saved)}`);
+        needContinue = true;
+        continue;
+      }
+
+      // ======================================================
+      // save_memory
+      // ======================================================
+
+      if (name === "save_memory") {
+        if (!userId) {
+          workingMessages.push({
+            role: "tool",
+            tool_call_id: toolCallId,
+            name: "save_memory",
+            content: "当前请求没有有效的 QQ 用户 UID，因此不能保存长期记忆。",
+          });
+
+          needContinue = true;
+          continue;
+        }
+
+        if (!memorySearchPerformed) {
+          workingMessages.push({
+            role: "tool",
+            tool_call_id: toolCallId,
+            name: "save_memory",
+            content: "保存前请先调用 search_memory 查找并复用已有 key；不要凭空新造 key。",
+          });
+          needContinue = true;
+          continue;
+        }
+
+        memoryWriteCount++;
+
+        const result = await saveMemory(userId, args);
+
+        workingMessages.push({
+          role: "tool",
+          tool_call_id: toolCallId,
+          name: "save_memory",
+          content: result.content,
+        });
+
+        console.log(
+          `[Core] save_memory 完成 | uid=${String(userId)} | operation=${String(args?.operation || "")} | key=${String(args?.key || "").slice(0, 80)} | saved=${Boolean(result.saved)} | forcedReplace=${Boolean(result.forcedReplace)} | duplicate=${Boolean(result.duplicate)} | writes=${memoryWriteCount}/${MAX_MEMORY_WRITES_PER_REQUEST}` ,
+        );
+
+        needContinue = true;
+        continue;
+      }
+
+      // ======================================================
+      // generate_image
+      // ======================================================
+
+      if (name === "generate_image") {
+        const imageResult = executeImageTool({
           sessionId,
           history,
           historyTextEntry: effectiveHistoryTextEntry,
           args,
+          imageSourceUrl: imageSourceUrl || null,
+          lastImage,
           onImageReady,
           onImageError,
         });
+        return imageResult && typeof imageResult === "object"
+          ? { ...imageResult, mentionQqs: [...pendingMentionQqs] }
+          : imageResult;
       }
 
       // ======================================================
@@ -2074,19 +2333,7 @@ ${searchInfo}`,
       // ======================================================
 
       if (name === "generate_video") {
-        if (!generationIntent.allowVideo) {
-          console.warn("[Core] 拒绝非本轮意图触发的视频生成 Tool Call");
-          workingMessages.push({
-            role: "tool",
-            tool_call_id: toolCallId,
-            name: "generate_video",
-            content: "本轮用户没有明确要求生成或修改视频，因此本次视频生成调用被拦截。请直接回答当前问题。",
-          });
-          needContinue = true;
-          continue;
-        }
-
-        return executeVideoTool({
+        const videoResult = await executeVideoTool({
           sessionId,
           history,
           historyTextEntry: effectiveHistoryTextEntry,
@@ -2095,6 +2342,9 @@ ${searchInfo}`,
           onVideoReady,
           onVideoError,
         });
+        return videoResult && typeof videoResult === "object"
+          ? { ...videoResult, mentionQqs: [...pendingMentionQqs] }
+          : videoResult;
       }
 
       // ======================================================
@@ -2137,9 +2387,59 @@ ${searchInfo}`,
     break;
   }
 
+  // 工具轮次耗尽时再发一次“无工具最终回答”请求，避免模型只执行了工具却没有给用户最终文本。
+  try {
+    workingMessages.push({
+      role: "system",
+      content:
+        "所有必要的工具操作已经完成。现在必须直接、自然地回答当前用户最后一条消息。不要再调用任何工具，也不要提及工具调用过程。",
+    });
+
+    const finalResponse = await requestAgnesStreaming(
+      {
+        model: MODEL,
+        messages: workingMessages,
+        tools: [],
+        tool_choice: "none",
+        ...(thinkingEnabled
+          ? {
+              chat_template_kwargs: {
+                enable_thinking: true,
+              },
+            }
+          : {}),
+      },
+      {
+        thinkingEnabled,
+        onThinkingStart: notifyThinkingStart,
+      },
+    );
+
+    let replyText = cleanModelReply(finalResponse?.data?.choices?.[0]?.message?.content);
+
+    if (thinkingEnabled && totalThinkingDurationMs > 0) {
+      const thinkingSeconds = (totalThinkingDurationMs / 1000).toFixed(1);
+      replyText = `[思考用时 ${thinkingSeconds}s]\n` + replyText;
+    }
+
+    if (replyText) {
+      history.push({ role: "user", content: normalizeHistoryText(effectiveHistoryTextEntry) });
+      history.push({ role: "assistant", content: normalizeHistoryText(replyText) });
+      trimHistory(sessionId, history);
+
+      return {
+        type: "text",
+        content: replyText,
+        mentionQqs: [...pendingMentionQqs],
+      };
+    }
+  } catch (error) {
+    console.error(`[Core] 最终无工具回答失败: ${error.name}: ${error.message}`);
+  }
+
   return {
     type: "text",
-    content: "唔……工具处理轮次有点多了，我先停一下喵。",
+    content: "刚才没接上…",
   };
 }
 

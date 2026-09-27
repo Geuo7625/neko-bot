@@ -11,6 +11,10 @@ const BOT_QQ = "2716519388";
 const BOT_NICKNAME = "NekoCode";
 const CODE_CHUNK_SIZE = 3000;
 
+/*
+ * 只有这些语言的“围栏代码块”才会被渲染成图片。
+ * 普通文本中的 Markdown / LaTeX 语法一律不再触发图片渲染。
+ */
 const RICH_CODE_LANGUAGES = new Set([
   "markdown",
   "md",
@@ -399,18 +403,12 @@ function repairBrokenLatex(code) {
     const escaped = environment.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
     repaired = repaired.replace(
-      new RegExp(
-        `(^|[\\s{}])(?:I|l)begin\\s*\\{${escaped}\\}`,
-        "g",
-      ),
+      new RegExp(`(^|[\\s{}])(?:I|l)begin\\s*\\{${escaped}\\}`, "g"),
       `$1\\\\begin{${environment}}`,
     );
 
     repaired = repaired.replace(
-      new RegExp(
-        `(^|[\\s{}])(?:I|l)end\\s*\\{${escaped}\\}`,
-        "g",
-      ),
+      new RegExp(`(^|[\\s{}])(?:I|l)end\\s*\\{${escaped}\\}`, "g"),
       `$1\\\\end{${environment}}`,
     );
   }
@@ -428,22 +426,17 @@ function repairBrokenLatex(code) {
     /\\end\s*\{\s*document\s*\}/i.test(repaired);
 
   if (!validAfterRepair) {
-    console.warn(
-      "[SpecialContent] LaTeX 容错失败，保持原文",
-    );
+    console.warn("[SpecialContent] LaTeX 容错失败，保持原文");
 
     return source;
   }
 
   if (repaired !== source) {
-    console.warn(
-      "[SpecialContent] 检测到疑似损坏 LaTeX，已自动恢复",
-    );
+    console.warn("[SpecialContent] 检测到疑似损坏 LaTeX，已自动恢复");
   }
 
   return repaired;
 }
-
 
 function getBlockCode(block) {
   const raw = getRawBlockCode(block);
@@ -617,6 +610,19 @@ function splitMessages(text) {
     .filter(Boolean);
 }
 
+/*
+ * ============================================================
+ * 核心：只有“代码块包裹”的内容才允许被渲染成图片
+ * ============================================================
+ *
+ * - text      → 纯文本发送
+ * - markdown  → 纯文本发送（重要：不再渲染图片）
+ * - code      → 只有命中 RICH_CODE_LANGUAGES 才渲染图片，
+ *                否则按普通代码块转发
+ *
+ * 普通消息里的 $...$、$$...$$、**加粗**、标题、列表等
+ * 不再触发任何图片渲染。
+ */
 async function sendSpecialContent(targetId, isGroup, text) {
   if (!text) {
     return;
@@ -646,25 +652,44 @@ async function sendSpecialContent(targetId, isGroup, text) {
         continue;
       }
 
+      /*
+       * 关键修改：
+       *
+       * 之前的实现会在这里把 markdown 交给 sendRichBlock()，
+       * 于是普通文本只要包含 $...$、**xx**、# 标题 等语法，
+       * 就会被强制渲染成图片。
+       *
+       * 现在改为纯文本发送：
+       * 只有被代码块包裹的内容才会进入图片渲染流程。
+       */
       if (block.type === "markdown") {
-        await sendRichBlock(targetId, isGroup, block.markdown);
+        await sendPlainText(targetId, isGroup, block.markdown);
 
         continue;
       }
 
       if (block.type === "code") {
+        /*
+         * 非白名单语言的代码块 → 走转发，不渲染图片。
+         */
         if (!isRichCodeBlock(block)) {
           await sendCodeBlock(targetId, isGroup, block.code);
 
           continue;
         }
 
+        /*
+         * LaTeX 代码块 → 专用渲染通道。
+         */
         if (isLatexCodeBlock(block)) {
           await sendLatexCodeBlock(targetId, isGroup, block);
 
           continue;
         }
 
+        /*
+         * markdown / mermaid 等白名单代码块 → 渲染成图片。
+         */
         const richContent = getRichContentFromCodeBlock(block);
 
         if (richContent) {
