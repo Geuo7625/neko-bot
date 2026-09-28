@@ -155,7 +155,12 @@ async function sendImage(targetId, isGroup, imageBase64) {
   });
 }
 
-async function sendRichBlock(targetId, isGroup, markdown) {
+async function sendRichBlock(
+  targetId,
+  isGroup,
+  markdown,
+  fallbackCode = markdown,
+) {
   if (!markdown || !markdown.trim()) {
     return;
   }
@@ -164,18 +169,18 @@ async function sendRichBlock(targetId, isGroup, markdown) {
     const imageBase64 = await renderRichContentToBase64(markdown);
 
     if (!imageBase64) {
-      console.error("[SpecialContent] rich 渲染失败，降级原文");
+      console.error("[SpecialContent] rich 渲染失败，降级代码块");
 
-      await sendPlainText(targetId, isGroup, markdown);
+      await sendCodeBlock(targetId, isGroup, fallbackCode);
 
       return;
     }
 
     await sendImage(targetId, isGroup, imageBase64);
   } catch (error) {
-    console.error("[SpecialContent] rich 发送失败，降级原文:", error);
+    console.error("[SpecialContent] rich 发送失败，降级代码块:", error);
 
-    await sendPlainText(targetId, isGroup, markdown);
+    await sendCodeBlock(targetId, isGroup, fallbackCode);
   }
 }
 
@@ -527,6 +532,7 @@ async function sendLatexCodeBlock(targetId, isGroup, block) {
       `$$
 ${code}
 $$`,
+      code,
     );
 
     return;
@@ -536,18 +542,18 @@ $$`,
     const imageBase64 = await renderFullLatexToBase64(code);
 
     if (!imageBase64) {
-      console.error("[SpecialContent] 完整 LaTeX 编译器不可用，降级原文");
+      console.error("[SpecialContent] 完整 LaTeX 编译器不可用，降级代码块");
 
-      await sendPlainText(targetId, isGroup, code);
+      await sendCodeBlock(targetId, isGroup, code);
 
       return;
     }
 
     await sendImage(targetId, isGroup, imageBase64);
   } catch (error) {
-    console.error("[SpecialContent] 完整 LaTeX 编译失败，降级原文:", error);
+    console.error("[SpecialContent] 完整 LaTeX 编译失败，降级代码块:", error);
 
-    await sendPlainText(targetId, isGroup, code);
+    await sendCodeBlock(targetId, isGroup, code);
   }
 }
 
@@ -586,6 +592,7 @@ async function sendLatexImage(targetId, isGroup, latex) {
     `$$
 ${latex}
 $$`,
+    latex,
   );
 }
 
@@ -691,9 +698,15 @@ async function sendSpecialContent(targetId, isGroup, text) {
          * markdown / mermaid 等白名单代码块 → 渲染成图片。
          */
         const richContent = getRichContentFromCodeBlock(block);
+        const fallbackCode = getBlockCode(block);
 
         if (richContent) {
-          await sendRichBlock(targetId, isGroup, richContent);
+          await sendRichBlock(
+            targetId,
+            isGroup,
+            richContent,
+            fallbackCode,
+          );
         }
 
         continue;
