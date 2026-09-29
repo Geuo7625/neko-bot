@@ -27,6 +27,111 @@ const userLastPokeTime = new Map();
 const recentUsers = new Map();
 const groupHistoryClearPoints = new Map();
 
+// ===== QQ 用户限速 =====
+const RATE_LIMIT_MIN_INTERVAL_MS = 2000;
+const RATE_LIMIT_MAX_IN_FLIGHT = 3;
+const RATE_LIMIT_TRIGGER_WINDOW_MS = 10_000;
+const RATE_LIMIT_TRIGGER_THRESHOLD = 10;
+const RATE_LIMIT_COOLDOWN_MS = 60_000;
+const RATE_LIMIT_NOTICE_SUPPRESS_MS = 10_000;
+const userRateStates = new Map();
+
+function getUserRateState(userId) {
+  const key = String(userId);
+  let state = userRateStates.get(key);
+  if (!state) {
+    state = {
+      lastMessageAt: 0,
+      inFlight: 0,
+      triggerTimes: [],
+      cooldownUntil: 0,
+      lastNoticeType: null,
+      lastNoticeAt: 0,
+    };
+    userRateStates.set(key, state);
+  }
+  return state;
+}
+
+function checkUserRateLimit(userId) {
+  const now = Date.now();
+  const state = getUserRateState(userId);
+  state.triggerTimes = state.triggerTimes.filter(
+    (time) => now - time <= RATE_LIMIT_TRIGGER_WINDOW_MS,
+  );
+
+  if (state.cooldownUntil > now) {
+    return { allowed: false, type: "cooldown" };
+  }
+
+  const tooFast =
+    state.lastMessageAt > 0 &&
+    now - state.lastMessageAt < RATE_LIMIT_MIN_INTERVAL_MS;
+  const tooManyInFlight = state.inFlight >= RATE_LIMIT_MAX_IN_FLIGHT;
+  state.lastMessageAt = now;
+
+  if (!tooFast && !tooManyInFlight) return { allowed: true };
+
+  state.triggerTimes.push(now);
+  if (state.triggerTimes.length >= RATE_LIMIT_TRIGGER_THRESHOLD) {
+    state.cooldownUntil = now + RATE_LIMIT_COOLDOWN_MS;
+    state.triggerTimes = [];
+    return { allowed: false, type: "cooldown" };
+  }
+
+  return { allowed: false, type: "slow" };
+}
+
+function beginUserApiRequest(userId) {
+  getUserRateState(userId).inFlight++;
+}
+
+function endUserApiRequest(userId) {
+  const state = getUserRateState(userId);
+  state.inFlight = Math.max(0, state.inFlight - 1);
+}
+
+function shouldSendRateLimitNotice(userId, type) {
+  const now = Date.now();
+  const state = getUserRateState(userId);
+  if (
+    state.lastNoticeType === type &&
+    now - state.lastNoticeAt < RATE_LIMIT_NOTICE_SUPPRESS_MS
+  ) {
+    return false;
+  }
+  state.lastNoticeType = type;
+  state.lastNoticeAt = now;
+  return true;
+}
+
+function cleanupUserRateStates() {
+  const now = Date.now();
+  for (const [key, state] of userRateStates) {
+    state.triggerTimes = state.triggerTimes.filter(
+      (time) => now - time <= RATE_LIMIT_TRIGGER_WINDOW_MS,
+    );
+    if (
+      state.inFlight === 0 &&
+      state.cooldownUntil <= now &&
+      state.triggerTimes.length === 0 &&
+      (state.lastMessageAt === 0 ||
+        now - state.lastMessageAt > RATE_LIMIT_TRIGGER_WINDOW_MS)
+    ) {
+      userRateStates.delete(key);
+    }
+  }
+}
+
+setInterval(cleanupUserRateStates, 30_000);
+
+async function sendUserRateLimitReply(ws, targetId, isGroup, userId, type) {
+  if (!shouldSendRateLimitNotice(userId, type)) return;
+  const text =
+    type === "cooldown" ? "有点累了…让我歇会" : "慢点…我跟不上了";
+  await sendQqMsg(ws, targetId, isGroup, text);
+}
+
 let globalGroupHistoryClearTime = 0;
 let lastRandomPokeTime = 0;
 
@@ -470,28 +575,6 @@ async function sendQqPoke(ws, userId, groupId = null) {
     console.error(`[QQ戳戳] 失败: ${error.message}`);
     return false;
   }
-}
-
-// ===== 判断用户是否要求拍自己 =====
-
-function wantsPokeSelf(text) {
-  if (!text) return false;
-  text = text.trim().toLowerCase();
-  const patterns = [
-    /戳我/,
-    /戳一下我/,
-    /戳我一下/,
-    /你戳我/,
-    /你戳一下我/,
-    /你戳我一下/,
-    /拍我/,
-    /拍一下我/,
-    /拍我一下/,
-    /你拍我/,
-    /你拍一下我/,
-    /你拍我一下/,
-  ];
-  return patterns.some((pattern) => pattern.test(text));
 }
 
 // ===== QQ 头像 =====
@@ -1008,6 +1091,8 @@ async function handleQqEvent(ws, event) {
   let userText = "";
   let imageContent = null;
   let imageSourceUrl = null;
+  let imageSegmentData = null;
+  let hasImageSegment = false;
   let isMentioned = false;
   let isAtAll = false;
   let targetAvatarQq = null;
@@ -1034,21 +1119,12 @@ async function handleQqEvent(ws, event) {
     } else if (segType === "text") {
       userText += segData.text || "";
     } else if (segType === "image") {
-      const imgUrl = segData.url || segData.file;
-      if (imgUrl) {
-        imageSourceUrl = segData.url || segData.file || null;
-        imageContent = await downloadImageReference(segData, 10000);
-
-        if (imageContent) {
-          saveRecentImageContext({
-            isGroup,
-            groupId,
-            userId: senderId,
-            imageContent,
-            sourceImageUrl: imageSourceUrl,
-            messageId,
-            messageTime,
-          });
+      hasImageSegment = true;
+      if (!imageSegmentData) {
+        const imgUrl = segData.url || segData.file;
+        if (imgUrl) {
+          imageSegmentData = segData;
+          imageSourceUrl = segData.url || segData.file || null;
         }
       }
     } else if (segType === "reply") {
@@ -1188,41 +1264,8 @@ async function handleQqEvent(ws, event) {
     return;
   }
 
-  // ----- 记录最近活跃用户 -----
-  const userKey = isGroup
-    ? `${groupId}_${String(senderId)}`
-    : `private_${String(senderId)}`;
-  recentUsers.set(userKey, {
-    groupId: isGroup ? groupId : null,
-    userId: String(senderId),
-  });
-
-  // ----- 用户要求拍自己 -----
-  if (wantsPokeSelf(userText)) {
-    await sendQqPoke(ws, senderId, groupId);
-    return;
-  }
-
-  // ----- 引用消息 -----
-  if (replyMessageId) {
-    const repliedMessage = await fetchQqMessage(replyMessageId);
-    if (repliedMessage) {
-      quotedMessageContext = buildQuotedMessageContext(repliedMessage, {
-        selfId,
-      });
-      const repliedImageSource = extractImageSourceFromMessage(repliedMessage);
-
-      if (!imageContent) {
-        const repliedImage = await extractImageFromMessage(repliedMessage);
-        if (repliedImage) {
-          imageContent = repliedImage;
-          imageSourceUrl = repliedImageSource;
-        }
-      }
-    }
-  }
-
   // ----- 群聊回复判断 -----
+  let autoTalk = false;
   if (isGroup) {
     const currentTime = Date.now() / 1000;
     const lastTalk = groupLastRandomTalk.get(String(groupId)) || 0;
@@ -1238,20 +1281,96 @@ async function handleQqEvent(ws, event) {
       shouldReply = false;
     } else if (containsName) {
       if (currentTime - lastTalk > 180 && Math.random() < 0.3) {
-        groupLastRandomTalk.set(String(groupId), currentTime);
         shouldReply = true;
+        autoTalk = true;
       }
     } else if (currentTime - lastTalk > 600 && Math.random() < 0.005) {
-      groupLastRandomTalk.set(String(groupId), currentTime);
       shouldReply = true;
+      autoTalk = true;
     }
 
-    if (!shouldReply && !(!userText && imageContent && isMentioned)) return;
+    if (!shouldReply && !(!userText && hasImageSegment && isMentioned)) return;
+  }
+
+  // 只有确定这条消息会被机器人处理时，才检查用户限速。
+  // 普通未 @ 机器人的群消息会在这里之前直接结束，不会触发限速提示。
+  const rateLimit = checkUserRateLimit(senderId);
+  if (!rateLimit.allowed) {
+    const rateTargetId = isGroup ? groupId : senderId;
+    try {
+      await sendUserRateLimitReply(
+        ws,
+        rateTargetId,
+        isGroup,
+        senderId,
+        rateLimit.type,
+      );
+    } catch (error) {
+      console.error(`[QQ限速] 提示发送失败: ${error.message}`);
+    }
+    return;
+  }
+
+  if (autoTalk) {
+    groupLastRandomTalk.set(String(groupId), Date.now() / 1000);
+  }
+
+  // 自动接话只看群聊上下文，不针对当前这条消息。
+
+  // ----- 记录最近活跃用户 -----
+  const userKey = isGroup
+    ? `${groupId}_${String(senderId)}`
+    : `private_${String(senderId)}`;
+  recentUsers.set(userKey, {
+    groupId: isGroup ? groupId : null,
+    userId: String(senderId),
+  });
+
+  // ----- 引用消息 -----
+  if (!autoTalk && replyMessageId) {
+    const repliedMessage = await fetchQqMessage(replyMessageId);
+    if (repliedMessage) {
+      quotedMessageContext = buildQuotedMessageContext(repliedMessage, {
+        selfId,
+      });
+      const repliedImageSource = extractImageSourceFromMessage(repliedMessage);
+
+      if (!imageSegmentData && !imageContent) {
+        const repliedImage = await extractImageFromMessage(repliedMessage);
+        if (repliedImage) {
+          imageContent = repliedImage;
+          imageSourceUrl = repliedImageSource;
+        }
+      }
+    }
+  }
+
+  // ----- 当前图片 -----
+  if (!autoTalk && imageSegmentData && !imageContent) {
+    imageContent = await downloadImageReference(imageSegmentData, 10000);
+    if (imageContent) {
+      saveRecentImageContext({
+        isGroup,
+        groupId,
+        userId: senderId,
+        imageContent,
+        sourceImageUrl: imageSourceUrl,
+        messageId,
+        messageTime,
+      });
+    }
+  }
+
+  // 自动接话不带入当前图片、当前引用，也不使用当前消息触发搜索。
+  if (autoTalk) {
+    imageContent = null;
+    imageSourceUrl = null;
+    quotedMessageContext = "";
   }
 
   // ----- 头像 -----
   const avatarKeywords = ["头像", "看头像", "长什么样"];
-  if (avatarKeywords.some((kw) => userText.includes(kw))) {
+  if (!autoTalk && avatarKeywords.some((kw) => userText.includes(kw))) {
     if (userText.includes("我") || userText.includes("自己")) {
       targetAvatarQq = String(senderId);
     } else if (
@@ -1274,7 +1393,7 @@ async function handleQqEvent(ws, event) {
 
   // ----- 最近图片视觉上下文 -----
   let recentImageContext = null;
-  if (!imageContent) {
+  if (!autoTalk && !imageContent) {
     recentImageContext = getRecentImageContext({
       isGroup,
       groupId,
@@ -1289,7 +1408,7 @@ async function handleQqEvent(ws, event) {
   }
 
   // ----- 空消息 -----
-  if (!userText && !imageContent && !quotedMessageContext) {
+  if (!autoTalk && !userText && !imageContent && !quotedMessageContext) {
     if (isMentioned) {
       const emptyAtPrompt = isOwner
         ? "[事件] 主人@了你但未发言。亲切回应"
@@ -1319,21 +1438,29 @@ async function handleQqEvent(ws, event) {
   // ----- 构造 AI 上下文 -----
   const promptParts = [];
   if (groupContextPrompt) promptParts.push(groupContextPrompt);
-  if (quotedMessageContext) promptParts.push(`\n${quotedMessageContext}\n`);
 
-  if (recentImageContext && !replyMessageId) {
+  if (autoTalk) {
     promptParts.push(
-      "\n[最近图片：候选视觉上下文；仅在与当前输入相关时使用，否则忽略，不要主动提及。]\n",
+      "\n[群聊自动接话]\n只根据上面最近几条群聊消息，概括大家正在聊什么，然后自然、简短地接一句。不要针对某一个人的单条消息回复，不要点名，不要逐条复述，不要搜索，不要调用工具，也不要提及这是群聊历史。尽量只说一句话。",
     );
+  } else {
+    if (quotedMessageContext) promptParts.push(`\n${quotedMessageContext}\n`);
+
+    if (recentImageContext && !replyMessageId) {
+      promptParts.push(
+        "\n[最近图片：候选视觉上下文；仅在与当前输入相关时使用，否则忽略，不要主动提及。]\n",
+      );
+    }
+
+    if (imageContent && !recentImageContext && !replyMessageId) {
+      promptParts.push(
+        "\n[当前图片：按当前输入判断是否需要分析，不要无关展开。]\n",
+      );
+    }
+
+    if (userText) promptParts.push(userText);
   }
 
-  if (imageContent && !recentImageContext && !replyMessageId) {
-    promptParts.push(
-      "\n[当前图片：按当前输入判断是否需要分析，不要无关展开。]\n",
-    );
-  }
-
-  if (userText) promptParts.push(userText);
   const finalPrompt = promptParts.join("");
 
   console.log(
@@ -1341,20 +1468,25 @@ async function handleQqEvent(ws, event) {
   );
 
   // ----- 调用 Core -----
-  const historyQuotePrefix = quotedMessageContext
-    ? `${quotedMessageContext}\n`
-    : "";
-  const cleanUserHistoryEntry = imageContent
-    ? `${historyQuotePrefix}${recentImageContext ? "[本轮引用了最近图片上下文]" : "[当前用户发送了一张图片]"}${userText ? `\n${userText}` : ""}`
-    : `${historyQuotePrefix}${userText}`;
+  beginUserApiRequest(senderId);
+  let res;
+  try {
+    const historyQuotePrefix = quotedMessageContext
+      ? `${quotedMessageContext}\n`
+      : "";
+    const cleanUserHistoryEntry = autoTalk
+      ? "[自动接话]"
+      : imageContent
+        ? `${historyQuotePrefix}${recentImageContext ? "[本轮引用了最近图片上下文]" : "[当前用户发送了一张图片]"}${userText ? `\n${userText}` : ""}`
+        : `${historyQuotePrefix}${userText}`;
 
-  const res = await coreProcessChat(sessionId, finalPrompt, imageContent, {
+    res = await coreProcessChat(sessionId, finalPrompt, imageContent, {
     isOwner,
     isGroup,
     userId: String(senderId),
     botId: String(selfId),
     botName,
-    searchText: userText,
+    searchText: autoTalk ? null : userText,
     thinkingText: userText,
     imageSourceUrl,
     historyTextEntry: cleanUserHistoryEntry,
@@ -1413,6 +1545,9 @@ async function handleQqEvent(ws, event) {
       return await sendQqPoke(ws, userId, groupId);
     },
   });
+  } finally {
+    endUserApiRequest(senderId);
+  }
 
   // ----- 输出处理 -----
   if (res?.type === "text") {

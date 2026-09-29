@@ -1,8 +1,8 @@
 import axios from "axios";
 
 import {
-  AGNES_API_KEY,
-  AGNES_IMAGE_URL,
+  AI_API_KEY,
+  AI_IMAGE_URL,
   IMAGE_MODEL,
 } from "./config.js";
 
@@ -24,7 +24,7 @@ const DEFAULT_RATIO = "4:3";
  *   edit_last = 使用 sourceImageUrls 中的图片进行图生图/多图合成
  *
  * sourceImageUrls:
- *   传给 AGNES extra_body.image 的 URL 数组
+ *   传给图片 API extra_body.image 的 URL 数组
  */
 async function generateImage(
   prompt,
@@ -57,7 +57,7 @@ async function generateImage(
     throw new Error("edit_last 缺少可用的源图片 URL");
   }
 
-  // 严格按 AGNES 图片 API 示例组织请求。
+  // 按图片 API 示例组织请求。
   // 图生图 / 多图合成：extra_body.image = [url1, url2, ...]
   // 统一要求返回 URL，方便 QQ 直接发送。
   const extraBody = {
@@ -81,11 +81,11 @@ async function generateImage(
 
   try {
     const response = await axios.post(
-      AGNES_IMAGE_URL,
+      AI_IMAGE_URL,
       payload,
       {
         headers: {
-          Authorization: `Bearer ${AGNES_API_KEY}`,
+          Authorization: `Bearer ${AI_API_KEY}`,
           "Content-Type": "application/json",
         },
         timeout: 60000,

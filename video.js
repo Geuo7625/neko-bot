@@ -1,13 +1,13 @@
 import axios from "axios";
 import {
-  AGNES_API_KEY,
-  AGNES_VIDEO_URL,
-  AGNES_VIDEO_RESULT_URL,
+  AI_API_KEY,
+  AI_VIDEO_URL,
+  AI_VIDEO_RESULT_URL,
   VIDEO_MODEL,
 } from "./config.js";
 
 // ============================================================
-// Agnes Video 2.5 / 2.5 Flash
+// 视频生成模型
 // ============================================================
 
 const DEFAULT_SECONDS = 5;
@@ -131,9 +131,9 @@ async function createVideoTask(
   );
 
   try {
-    const response = await axios.post(AGNES_VIDEO_URL, payload, {
+    const response = await axios.post(AI_VIDEO_URL, payload, {
       headers: {
-        Authorization: `Bearer ${AGNES_API_KEY}`,
+        Authorization: `Bearer ${AI_API_KEY}`,
         "Content-Type": "application/json",
       },
       timeout: 60000,
@@ -183,9 +183,9 @@ async function getVideoStatus(videoId) {
   }
 
   try {
-    const response = await axios.get(AGNES_VIDEO_RESULT_URL, {
+    const response = await axios.get(AI_VIDEO_RESULT_URL, {
       headers: {
-        Authorization: `Bearer ${AGNES_API_KEY}`,
+        Authorization: `Bearer ${AI_API_KEY}`,
       },
       params: {
         video_id: videoId,

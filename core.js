@@ -1,7 +1,7 @@
 import axios from "axios";
 import {
-  AGNES_API_KEY,
-  AGNES_URL,
+  AI_API_KEY,
+  AI_URL,
   MODEL,
   SYSTEM_PROMPT,
   MAX_HISTORY_LEN,
@@ -55,7 +55,7 @@ function stripThinkingTrigger(text) {
   return text.replace(THINKING_TRIGGER_PATTERN, "").trim();
 }
 
-const AGNES_FIRST_CHUNK_TIMEOUT = 60000;
+const AI_FIRST_CHUNK_TIMEOUT = 60000;
 
 // ============================================================
 // Tools
@@ -377,6 +377,21 @@ function cleanModelReply(text) {
   return text.replace(/\n{3,}/g, "\n\n").trim();
 }
 
+function stripMentionLiterals(text, mentionQqs) {
+  let value = String(text || "");
+  for (const qq of Array.isArray(mentionQqs) ? mentionQqs : []) {
+    const target = String(qq ?? "").trim();
+    if (!target) continue;
+    if (target === "all") {
+      value = value.replace(/@全体成员/g, "");
+      continue;
+    }
+    const escaped = target.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    value = value.replace(new RegExp(`@${escaped}(?!\\d)`, "g"), "");
+  }
+  return value.replace(/[ \t]{2,}/g, " ").trim();
+}
+
 function stripThinkingContent(text) {
   if (text === null || text === undefined) return "";
   return String(text)
@@ -654,11 +669,11 @@ function isRateLimitError(error) {
 
 function getChatErrorMessage(error) {
   const status = getHttpStatus(error);
-  if (status === 429) return "慢点…我有点跟不上了";
+  if (status === 429) return "慢点…我跟不上了";
   if (status === 500 || status === 502 || status === 503 || status === 504)
     return "刚才没接上…";
   if (
-    error?.code === "AGNES_FIRST_CHUNK_TIMEOUT" ||
+    error?.code === "AI_FIRST_CHUNK_TIMEOUT" ||
     error?.code === "ECONNABORTED" ||
     error?.code === "ETIMEDOUT"
   )
@@ -837,15 +852,15 @@ async function requestAgnesStreaming(
       timeoutTriggered = true;
       controller.abort();
     }
-  }, AGNES_FIRST_CHUNK_TIMEOUT);
+  }, AI_FIRST_CHUNK_TIMEOUT);
 
   try {
     const response = await axios.post(
-      AGNES_URL,
+      AI_URL,
       { ...payload, stream: true },
       {
         headers: {
-          Authorization: `Bearer ${AGNES_API_KEY}`,
+          Authorization: `Bearer ${AI_API_KEY}`,
           "Content-Type": "application/json",
           Accept: "text/event-stream",
         },
@@ -1042,9 +1057,9 @@ async function requestAgnesStreaming(
 
     if (timeoutTriggered && !firstChunkReceived) {
       const timeoutError = new Error(
-        `API 首个 SSE 数据块超过 ${AGNES_FIRST_CHUNK_TIMEOUT}ms`,
+        `API 首个 SSE 数据块超过 ${AI_FIRST_CHUNK_TIMEOUT}ms`,
       );
-      timeoutError.code = "AGNES_FIRST_CHUNK_TIMEOUT";
+      timeoutError.code = "AI_FIRST_CHUNK_TIMEOUT";
       timeoutError.elapsed = elapsed;
       timeoutError.cause = error;
       throw timeoutError;
@@ -1265,8 +1280,8 @@ async function coreProcessChat(sessionId, userText, imageContent = null, options
       console.error(
         `[Chat] 请求失败 ${elapsed}ms round=${toolRound + 1} ${error.name}: ${error.message}`,
       );
-      if (error.code === "AGNES_FIRST_CHUNK_TIMEOUT") {
-        console.error(`[Chat] 首字超时 ${elapsed}ms > ${AGNES_FIRST_CHUNK_TIMEOUT}ms`);
+      if (error.code === "AI_FIRST_CHUNK_TIMEOUT") {
+        console.error(`[Chat] 首字超时 ${elapsed}ms > ${AI_FIRST_CHUNK_TIMEOUT}ms`);
       }
       if (error.response) {
         console.error(`[Chat] HTTP ${error.response.status}`);
@@ -1289,6 +1304,8 @@ async function coreProcessChat(sessionId, userText, imageContent = null, options
 
     if (!toolCalls.length) {
       let replyText = cleanModelReply(message.content);
+
+      if (pendingMentionQqs.length) replyText = stripMentionLiterals(replyText, pendingMentionQqs);
 
       if (thinkingEnabled && totalThinkingDurationMs > 0) {
         const thinkingSeconds = (totalThinkingDurationMs / 1000).toFixed(1);
@@ -1314,7 +1331,11 @@ async function coreProcessChat(sessionId, userText, imageContent = null, options
       });
       trimHistory(sessionId, history);
 
-      return { type: "text", content: replyText };
+      return {
+        type: "text",
+        content: replyText,
+        mentionQqs: [...pendingMentionQqs],
+      };
     }
 
     const filteredToolCalls = [];
@@ -1343,6 +1364,8 @@ async function coreProcessChat(sessionId, userText, imageContent = null, options
 
     if (filteredToolCalls.length === 0) {
       let replyText = cleanModelReply(message.content);
+
+      if (pendingMentionQqs.length) replyText = stripMentionLiterals(replyText, pendingMentionQqs);
       if (thinkingEnabled && totalThinkingDurationMs > 0) {
         const thinkingSeconds = (totalThinkingDurationMs / 1000).toFixed(1);
         replyText = `[思考用时 ${thinkingSeconds}s]\n` + replyText;
@@ -1367,7 +1390,11 @@ async function coreProcessChat(sessionId, userText, imageContent = null, options
       });
       trimHistory(sessionId, history);
 
-      return { type: "text", content: replyText };
+      return {
+        type: "text",
+        content: replyText,
+        mentionQqs: [...pendingMentionQqs],
+      };
     }
 
     workingMessages.push(filteredAssistantMessage);
@@ -1644,6 +1671,8 @@ async function coreProcessChat(sessionId, userText, imageContent = null, options
     let replyText = cleanModelReply(
       finalResponse?.data?.choices?.[0]?.message?.content,
     );
+
+    if (pendingMentionQqs.length) replyText = stripMentionLiterals(replyText, pendingMentionQqs);
 
     if (thinkingEnabled && totalThinkingDurationMs > 0) {
       const thinkingSeconds = (totalThinkingDurationMs / 1000).toFixed(1);

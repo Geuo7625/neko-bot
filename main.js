@@ -1,5 +1,5 @@
 import http from "http";
-import { BOT_TOKEN, AGNES_API_KEY } from "./config.js";
+import { BOT_TOKEN, AI_API_KEY } from "./config.js";
 import { buildTgApp } from "./bot-tg.js";
 import { handleQqWs } from "./bot-qq.js";
 import { handleLatexTest } from "./latex-test.js";
@@ -7,8 +7,8 @@ import { handleLatexTest } from "./latex-test.js";
 const CHECK_PORT = 18080;
 async function main() {
   // 检查必要的环境变量
-  if (!BOT_TOKEN || !AGNES_API_KEY) {
-    console.error("错误：请设置 BOT_TOKEN 和 AGNES_API_KEY 环境变量！");
+  if (!BOT_TOKEN || !AI_API_KEY) {
+    console.error("错误：请设置 BOT_TOKEN 和 AI_API_KEY 环境变量！");
     return;
   }
   const healthServer = http.createServer(async (req, res) => {
