@@ -17,7 +17,6 @@ const POLL_INTERVAL = 5000;
 const VIDEO_TIMEOUT = 10 * 60 * 1000;
 const COMPLETED_URL_RETRIES = 6;
 const COMPLETED_URL_RETRY_INTERVAL = 2000;
-
 const VIDEO_RATIOS = ["21:9", "16:9", "4:3", "1:1", "3:4", "9:16"];
 const VIDEO_SIZES = ["720P", "1080P", "1K", "2K"];
 
@@ -94,10 +93,10 @@ async function createVideoTask(
   };
 
   if (normalizedMode === "keyframe") {
-    const firstFrame = isUsableImageUrl(imageUrl) ? imageUrl.trim() : null;
+    const firstFrame = isUsableImageInput(imageUrl) ? imageUrl.trim() : null;
 
     if (!firstFrame && !isUsableImageInput(lastFrame)) {
-      throw new Error("keyframe 缺少有效的 first_frame 图片 URL");
+      throw new Error("keyframe 缺少有效的 first_frame 图片");
     }
 
     if (firstFrame) payload.first_frame = firstFrame;
@@ -162,13 +161,6 @@ async function createVideoTask(
       raw: data,
     };
   } catch (error) {
-    console.error("[Video] 创建视频任务失败:", error.message);
-    if (error.response?.data) {
-      console.error(
-        "[Video] API 返回:",
-        JSON.stringify(error.response.data, null, 2),
-      );
-    }
     throw error;
   }
 }
@@ -269,6 +261,7 @@ async function waitForVideo(
     }
 
     const data = await getVideoStatus(videoId);
+
     const status = String(data?.status || "").toLowerCase();
     const progress = data?.progress ?? 0;
 

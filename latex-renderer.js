@@ -207,9 +207,19 @@ async function ensureLocalServer() {
             "cmaps",
             rel,
           );
-        } else if (url.pathname === "/busytex/__module") {
-          file = busyConfig.moduleFile;
-        } else if (url.pathname.startsWith("/busytex/")) {
+} else if (url.pathname.startsWith("/assets/")) {
+  const rel = decodeURIComponent(url.pathname.slice("/assets/".length));
+
+  if (!rel || rel.includes("..") || path.isAbsolute(rel)) {
+    res.writeHead(400);
+    res.end("Bad path");
+    return;
+  }
+
+  file = path.join(BASE_DIR, "assets", rel);
+} else if (url.pathname === "/busytex/__module") {
+  file = busyConfig.moduleFile;
+} else if (url.pathname.startsWith("/busytex/")) {
           const rel = decodeURIComponent(
             url.pathname.slice("/busytex/".length),
           );
@@ -230,16 +240,20 @@ async function ensureLocalServer() {
         }
 
         const ext = path.extname(file).toLowerCase();
-        const types = {
-          ".html": "text/html; charset=utf-8",
-          ".css": "text/css; charset=utf-8",
-          ".js": "text/javascript; charset=utf-8",
-          ".mjs": "text/javascript; charset=utf-8",
-          ".wasm": "application/wasm",
-          ".data": "application/octet-stream",
-          ".bcmap": "application/octet-stream",
-          ".map": "application/json",
-        };
+const types = {
+  ".html": "text/html; charset=utf-8",
+  ".css": "text/css; charset=utf-8",
+  ".js": "text/javascript; charset=utf-8",
+  ".mjs": "text/javascript; charset=utf-8",
+  ".wasm": "application/wasm",
+  ".data": "application/octet-stream",
+  ".bcmap": "application/octet-stream",
+  ".map": "application/json",
+  ".ttf": "font/ttf",
+  ".otf": "font/otf",
+  ".woff": "font/woff",
+  ".woff2": "font/woff2",
+};
 
         res.writeHead(200, {
           "Content-Type": types[ext] || "application/octet-stream",

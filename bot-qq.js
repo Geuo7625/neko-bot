@@ -22,8 +22,22 @@ const BOT_CONFIG_PATH = path.join(__dirname, "bot-config.json");
 let botConfig = loadBotConfig();
 let botConfigMtime = getConfigMtime();
 
-const groupLastRandomTalk = new Map();
+const groupTalkStates = new Map();
 const userLastPokeTime = new Map();
+const pokeStreakStates = new Map();
+const POKE_STREAK_WINDOW_MS = 60_000;
+const POKE_STREAK_THRESHOLD = 3;
+
+const AUTO_TALK_IDLE_MS = 120_000;
+const AUTO_TALK_ACTIVE_WINDOW_MS = 20_000;
+const AUTO_TALK_ACTIVE_MIN_MESSAGES = 6;
+const AUTO_TALK_ACTIVE_MIN_USERS = 2;
+const AUTO_CHIME_MIN_MESSAGES = 3;
+const AUTO_CHIME_MAX_MESSAGES = AUTO_TALK_ACTIVE_MIN_MESSAGES - 1;
+const AUTO_CHIME_DEBOUNCE_MS = 1800;
+const AUTO_CHIME_CHECK_COOLDOWN_MS = 45_000;
+const AUTO_CHIME_SILENCE_TOKEN = "§NO_CHIME_7F31§";
+const AUTO_TALK_COOLDOWN_MS = 180_000;
 const recentUsers = new Map();
 const groupHistoryClearPoints = new Map();
 
@@ -124,6 +138,41 @@ function cleanupUserRateStates() {
 }
 
 setInterval(cleanupUserRateStates, 30_000);
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, state] of pokeStreakStates) {
+    if (now - state.lastAt > POKE_STREAK_WINDOW_MS) pokeStreakStates.delete(key);
+  }
+  for (const [key, entry] of forwardContextCache) {
+    if (!entry || now - entry.savedAt > FORWARD_CONTEXT_TTL_MS) forwardContextCache.delete(key);
+  }
+}, 60_000);
+
+function getPokeStreakKey(userId, groupId = null) {
+  return `${groupId === null || groupId === undefined ? "private" : `group:${String(groupId)}`}::${String(userId)}`;
+}
+
+function resetPokeStreak(userId, groupId = null) {
+  pokeStreakStates.delete(getPokeStreakKey(userId, groupId));
+}
+
+// 前 3 次正常回复；之后第 4、6、8……次只直接回戳，不请求模型。
+function shouldSkipPokeApi(userId, groupId = null) {
+  const key = getPokeStreakKey(userId, groupId);
+  const now = Date.now();
+  let state = pokeStreakStates.get(key);
+
+  if (!state || now - state.lastAt > POKE_STREAK_WINDOW_MS) {
+    state = { count: 0, lastAt: now };
+  }
+
+  state.count++;
+  state.lastAt = now;
+  pokeStreakStates.set(key, state);
+
+  return state.count > POKE_STREAK_THRESHOLD &&
+    (state.count - POKE_STREAK_THRESHOLD) % 2 === 1;
+}
 
 async function sendUserRateLimitReply(ws, targetId, isGroup, userId, type) {
   if (!shouldSendRateLimitNotice(userId, type)) return;
@@ -203,6 +252,280 @@ function cleanupRecentImageContexts() {
   }
 }
 setInterval(cleanupRecentImageContexts, 30_000);
+
+function getGroupTalkState(groupId) {
+  const key = String(groupId);
+  let state = groupTalkStates.get(key);
+  if (!state) {
+    state = {
+      messages: [],
+      lastMessageAt: 0,
+      lastMessageId: null,
+      lastAutoTalkAt: 0,
+      idleTimer: null,
+      activeChimeTimer: null,
+      lastChimeCheckAt: 0,
+      autoTalkInFlight: false,
+    };
+    groupTalkStates.set(key, state);
+  }
+  return state;
+}
+
+function clearGroupIdleTimer(state) {
+  if (state?.idleTimer) {
+    clearTimeout(state.idleTimer);
+    state.idleTimer = null;
+  }
+}
+
+function clearGroupChimeTimer(state) {
+  if (state?.activeChimeTimer) {
+    clearTimeout(state.activeChimeTimer);
+    state.activeChimeTimer = null;
+  }
+}
+
+function hasRecentGroupMention(groupContextPrompt) {
+  return /@(?:全体成员|\d{5,12})/.test(String(groupContextPrompt || ""));
+}
+
+async function performGroupAutoTalk(
+  ws,
+  { groupId, selfId, botName, mode = "idle", excludeMessageId = null },
+) {
+  if (groupId === null || groupId === undefined) return;
+  if (isNoRandomTalkGroup(groupId)) return;
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+  const state = getGroupTalkState(groupId);
+  if (state.autoTalkInFlight) return;
+
+  const now = Date.now();
+  if (now - state.lastAutoTalkAt < AUTO_TALK_COOLDOWN_MS) return;
+
+  if (mode === "idle" && state.lastMessageAt && now - state.lastMessageAt < AUTO_TALK_IDLE_MS) {
+    return;
+  }
+
+  state.autoTalkInFlight = true;
+  clearGroupIdleTimer(state);
+
+  try {
+    const groupContextPrompt = await fetchGroupHistory(
+      groupId,
+      excludeMessageId,
+      selfId,
+    );
+    if (!groupContextPrompt || hasRecentGroupMention(groupContextPrompt)) return;
+
+    const modePrompt =
+      mode === "active"
+        ? "顺着最近话题说一个简短观点，只说一句。"
+        : "群里安静了两分钟，只说一句很短的话，尽量十几字。";
+    const contextPrompt = `${groupContextPrompt}\n${modePrompt}`;
+    const sessionId = `qq_group_${String(groupId)}_auto`;
+
+    const res = await coreProcessChat(sessionId, "[自动接话]", undefined, {
+      isOwner: false,
+      isGroup: true,
+      userId: null,
+      botId: String(selfId),
+      botName,
+      searchText: null,
+      thinkingText: null,
+      contextPrompt,
+      allowTools: false,
+      historyTextEntry: "[自动接话]",
+    });
+
+    if (res?.type === "text" && res.content) {
+      await sendAiTextMessages(ws, groupId, true, res.content, res.mentionQqs);
+      state.lastAutoTalkAt = Date.now();
+    }
+  } catch (error) {
+    console.error(`[群聊自动接话] 失败 group=${groupId}: ${error.message}`);
+  } finally {
+    state.autoTalkInFlight = false;
+  }
+}
+
+function isNoChimeResponse(text) {
+  return String(text ?? "").trim() === AUTO_CHIME_SILENCE_TOKEN;
+}
+
+async function performGroupConversationChime(
+  ws,
+  { groupId, selfId, botName, excludeMessageId = null },
+) {
+  if (groupId === null || groupId === undefined) return;
+  if (isNoRandomTalkGroup(groupId)) return;
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+  const state = getGroupTalkState(groupId);
+  const now = Date.now();
+  if (state.autoTalkInFlight) return;
+  if (now - state.lastAutoTalkAt < AUTO_TALK_COOLDOWN_MS) return;
+  if (now - state.lastChimeCheckAt < AUTO_CHIME_CHECK_COOLDOWN_MS) return;
+
+  state.messages = state.messages.filter(
+    (item) => now - item.at <= AUTO_TALK_ACTIVE_WINDOW_MS,
+  );
+  const uniqueUsers = new Set(state.messages.map((item) => item.userId));
+  const hasMention = state.messages.some((item) => item.hasMention);
+  if (
+    hasMention ||
+    state.messages.length < AUTO_CHIME_MIN_MESSAGES ||
+    state.messages.length > AUTO_CHIME_MAX_MESSAGES ||
+    uniqueUsers.size < AUTO_TALK_ACTIVE_MIN_USERS
+  ) {
+    return;
+  }
+
+  state.autoTalkInFlight = true;
+  state.lastChimeCheckAt = now;
+
+  try {
+    // 排除触发本次检查的最新消息，给模型的只有此前的群聊记录，不传当前群友的消息作为 user 请求。
+    const groupContextPrompt = await fetchGroupHistory(
+      groupId,
+      excludeMessageId,
+      selfId,
+    );
+    if (!groupContextPrompt || hasRecentGroupMention(groupContextPrompt)) return;
+
+    const contextPrompt = `${groupContextPrompt}
+【任务：判断是否自然接话】你是在旁观群聊，不是在回答某个当前用户的问题。根据上面的近期聊天记录判断是否存在自然、有内容、能顺着群友思路补充观点的切入点。若话题零散、上下文不足、插话突兀、只能重复别人说过的话，或者你不确定是否适合接话，只输出这一串字符，不加引号、不加解释：${AUTO_CHIME_SILENCE_TOKEN}。如果适合接话，就直接说出自己的观点，像普通群友一样自然，不要提到自动接话或你正在做判断。可以使用多条短消息，不要 @ 任何人。`;
+
+    const sessionId = `qq_group_${String(groupId)}_chime_${Date.now()}`;
+    const res = await coreProcessChat(
+      sessionId,
+      "[群聊观察任务：判断是否适合自然接话]",
+      undefined,
+      {
+        isOwner: false,
+        isGroup: true,
+        userId: null,
+        botId: String(selfId),
+        botName,
+        searchText: null,
+        thinkingText: null,
+        contextPrompt,
+        allowTools: true,
+        toolAllowlist: ["send_multiple_messages"],
+        historyTextEntry: "[群聊观察任务：判断是否适合自然接话]",
+      },
+    );
+
+    let outgoing = [];
+    if (res?.type === "text" && res.content) {
+      const text = String(res.content).trim();
+      if (isNoChimeResponse(text)) {
+        console.log(`[群聊接话判断] 不接话 group=${groupId}`);
+        return;
+      }
+      if (text) outgoing = [text];
+    } else if (res?.type === "multi_text_pending" && Array.isArray(res.messages)) {
+      outgoing = res.messages.map((item) => String(item ?? "").trim()).filter(Boolean);
+      if (!outgoing.length || outgoing.some(isNoChimeResponse)) {
+        console.log(`[群聊接话判断] 不接话 group=${groupId}`);
+        return;
+      }
+    }
+
+    if (!outgoing.length) return;
+
+    for (let i = 0; i < outgoing.length; i++) {
+      await sendAiTextMessages(ws, groupId, true, outgoing[i]);
+      if (i < outgoing.length - 1) {
+        await new Promise((resolve) => setTimeout(resolve, 180));
+      }
+    }
+
+    state.lastAutoTalkAt = Date.now();
+    console.log(`[群聊接话判断] 已接话 group=${groupId} messages=${outgoing.length}`);
+  } catch (error) {
+    console.error(`[群聊接话判断] 失败 group=${groupId}: ${error.message}`);
+  } finally {
+    state.autoTalkInFlight = false;
+  }
+}
+
+function recordGroupTalkActivity(
+  ws,
+  { groupId, senderId, messageId, messageTime, selfId, botName, hasMention = false, suppressAutoTalk = false, suppressMediaAutoTalk = false },
+) {
+  if (groupId === null || groupId === undefined || suppressAutoTalk) return;
+  if (isNoRandomTalkGroup(groupId)) return;
+  if (isBlacklisted(senderId) || String(senderId) === String(selfId)) return;
+
+  const state = getGroupTalkState(groupId);
+  if (suppressMediaAutoTalk) {
+    clearGroupIdleTimer(state);
+    clearGroupChimeTimer(state);
+    state.lastMessageAt = Date.now();
+    state.lastMessageId = messageId ?? null;
+    return;
+  }
+  const now = Date.now();
+  const at = Number.isFinite(Number(messageTime)) && Number(messageTime) > 0
+    ? Number(messageTime) * 1000
+    : now;
+
+  state.messages.push({ at, userId: String(senderId), messageId, hasMention: Boolean(hasMention) });
+  state.messages = state.messages.filter((item) => now - item.at <= AUTO_TALK_ACTIVE_WINDOW_MS);
+  state.lastMessageAt = at;
+  state.lastMessageId = messageId ?? null;
+
+  clearGroupIdleTimer(state);
+  state.idleTimer = setTimeout(() => {
+    void performGroupAutoTalk(ws, {
+      groupId,
+      selfId,
+      botName,
+      mode: "idle",
+      excludeMessageId: null,
+    });
+  }, AUTO_TALK_IDLE_MS);
+
+  const uniqueUsers = new Set(state.messages.map((item) => item.userId));
+  const hasMentionInWindow = state.messages.some((item) => item.hasMention);
+  clearGroupChimeTimer(state);
+  if (
+    !hasMention &&
+    !hasMentionInWindow &&
+    state.messages.length >= AUTO_CHIME_MIN_MESSAGES &&
+    state.messages.length <= AUTO_CHIME_MAX_MESSAGES &&
+    uniqueUsers.size >= AUTO_TALK_ACTIVE_MIN_USERS
+  ) {
+    const latestMessageId = state.lastMessageId;
+    state.activeChimeTimer = setTimeout(() => {
+      state.activeChimeTimer = null;
+      void performGroupConversationChime(ws, {
+        groupId,
+        selfId,
+        botName,
+        excludeMessageId: latestMessageId,
+      });
+    }, AUTO_CHIME_DEBOUNCE_MS);
+  }
+
+  if (
+    !hasMention &&
+    !state.messages.some((item) => item.hasMention) &&
+    state.messages.length >= AUTO_TALK_ACTIVE_MIN_MESSAGES &&
+    uniqueUsers.size >= AUTO_TALK_ACTIVE_MIN_USERS &&
+    now - state.lastAutoTalkAt >= AUTO_TALK_COOLDOWN_MS
+  ) {
+    void performGroupAutoTalk(ws, {
+      groupId,
+      selfId,
+      botName,
+      mode: "active",
+      excludeMessageId: messageId ?? null,
+    });
+  }
+}
 
 // ===== HTTP =====
 const httpClient = axios.create({ timeout: 5000 });
@@ -314,6 +637,20 @@ function sanitizeInput(text) {
   return sanitizeText(text, getBotConfig().sensitiveWords.input);
 }
 
+function containsBotNameCall(text) {
+  const source = String(text ?? "");
+  if (!source) return false;
+
+  const names = [...new Set(["Yuragi", getBotConfig().nickname]
+    .map((name) => String(name ?? "").trim())
+    .filter(Boolean))];
+
+  return names.some((name) => {
+    const pattern = [...name].map(escapeRegExp).join("[\\s._-]*");
+    return new RegExp(`(^|[^a-z0-9_])${pattern}(?=$|[^a-z0-9_])`, "i").test(source);
+  });
+}
+
 function sanitizeOutput(text) {
   return sanitizeText(text, getBotConfig().sensitiveWords.output);
 }
@@ -413,51 +750,22 @@ async function sendQqMsg(
   return true;
 }
 
-// ===== AI 消息拆分 =====
-
-function splitQqMessages(text) {
-  return String(text)
-    .split(/===SPLIT===/g)
-    .map((part) => part.trim())
-    .filter(Boolean);
-}
+// ===== AI 消息拆分 / 特殊内容统一路由 =====
 
 async function sendAiTextMessages(ws, targetId, isGroup, text, mentionQqs = []) {
-  const messages = splitQqMessages(text);
-  const mentions = Array.isArray(mentionQqs)
-    ? [
-        ...new Set(
-          mentionQqs
-            .map((value) => String(value ?? "").trim())
-            .filter((value) => value === "all" || /^\d{5,12}$/.test(value)),
-        ),
-      ]
+  const message = sanitizeOutput(String(text ?? ""));
+  if (!message) return;
+
+  const mentions = isGroup && Array.isArray(mentionQqs)
+    ? [...new Set(mentionQqs
+        .map((value) => String(value ?? "").trim())
+        .filter((value) => value === "all" || /^\d{5,12}$/.test(value)))]
     : [];
 
-  if (!messages.length && !mentions.length) return;
-
-  let mentionsAttached = false;
-
-  for (let i = 0; i < messages.length; i++) {
-    const message = sanitizeOutput(messages[i]);
-    if (!message) continue;
-
-    if (!mentionsAttached && mentions.length) {
-      await sendQqMsg(ws, targetId, isGroup, message, null, null, mentions);
-      mentionsAttached = true;
-    } else {
-      await sendSpecialContent(targetId, isGroup, message);
-    }
-
-    if (i < messages.length - 1) {
-      await new Promise((resolve) => setTimeout(resolve, 80));
-    }
-  }
-
-  if (!mentionsAttached && mentions.length) {
-    await sendQqMsg(ws, targetId, isGroup, null, null, null, mentions);
-  }
+  // 特殊内容模块负责按 ===SPLIT=== 拆分，并将首个真实 @ 与正文放进同一条消息。
+  await sendSpecialContent(targetId, isGroup, message, mentions);
 }
+
 
 // ===== QQ 真实 @ =====
 
@@ -585,6 +893,168 @@ function getUserAvatarUrl(qq) {
 
 // ===== 消息段 -> 文本 =====
 
+const FORWARD_CONTEXT_TTL_MS = 60_000;
+const forwardContextCache = new Map();
+const MAX_FORWARD_DEPTH = 2;
+const MAX_FORWARD_NODES = 8;
+
+function decodeMarkupEntities(value) {
+  return String(value ?? "")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;|&apos;/gi, "'")
+    .replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(Number(n)))
+    .replace(/&#x([\da-f]+);/gi, (_, n) => String.fromCodePoint(parseInt(n, 16)));
+}
+
+function compactContextText(value, maxLength = 500) {
+  const text = decodeMarkupEntities(String(value ?? ""))
+    .replace(/<br\s*\/?>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/[\r\n\t]+/g, " ")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+  return text.length > maxLength ? `${text.slice(0, maxLength)}…` : text;
+}
+
+const CARD_FIELD_LABELS = {
+  title: "标题", prompt: "提示", desc: "简介", description: "简介",
+  summary: "摘要", text: "正文", content: "内容", url: "链接",
+  jumpurl: "跳转链接", jump_url: "跳转链接", shareurl: "分享链接",
+  share_url: "分享链接", groupname: "群名", group_name: "群名",
+  groupid: "群号", group_id: "群号", inviter: "邀请人",
+  invitor: "邀请人", nickname: "昵称", nick: "昵称", detail: "详情",
+  source: "来源", name: "名称", appname: "应用", file_name: "文件名",
+};
+const CARD_FIELD_KEYS = new Set(Object.keys(CARD_FIELD_LABELS));
+
+function parseJsonMaybe(value) {
+  if (value && typeof value === "object") return value;
+  const text = String(value ?? "").trim();
+  if (!text || !/^[{[]/.test(text)) return null;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+function extractStructuredFields(value, options = {}) {
+  const fields = [];
+  const seenValues = new Set();
+  const maxFields = options.maxFields ?? 10;
+  const maxDepth = options.maxDepth ?? 5;
+
+  function add(label, raw) {
+    if (raw === null || raw === undefined || typeof raw === "object") return;
+    const valueText = compactContextText(raw, label === "链接" || label === "跳转链接" || label === "分享链接" ? 350 : 220);
+    if (!valueText || seenValues.has(`${label}:${valueText}`)) return;
+    seenValues.add(`${label}:${valueText}`);
+    fields.push(`${label}：${valueText}`);
+  }
+
+  function visit(item, depth = 0) {
+    if (item === null || item === undefined || depth > maxDepth || fields.length >= maxFields) return;
+    if (typeof item === "string") {
+      const parsed = parseJsonMaybe(item);
+      if (parsed) {
+        visit(parsed, depth + 1);
+      } else {
+        const decoded = decodeMarkupEntities(item);
+        const tagPattern = /<(title|prompt|desc|description|summary|text|content|url|jumpurl|jump_url|shareurl|share_url|groupname|group_name|groupid|group_id|inviter|invitor|nickname|nick|detail|name)\b[^>]*>([\s\S]*?)<\/\1\s*>/gi;
+        let match;
+        while ((match = tagPattern.exec(decoded)) && fields.length < maxFields) {
+          const key = match[1].toLowerCase();
+          add(CARD_FIELD_LABELS[key] || key, match[2]);
+        }
+        const attrPattern = /\b(url|jumpurl|jump_url|shareurl|share_url|groupid|group_id|groupname|group_name)\s*=\s*["']([^"']+)["']/gi;
+        while ((match = attrPattern.exec(decoded)) && fields.length < maxFields) {
+          const key = match[1].toLowerCase();
+          add(CARD_FIELD_LABELS[key] || key, match[2]);
+        }
+        if (!fields.length) {
+          const urls = decoded.match(/https?:\/\/[^\s"'<>]+/gi) || [];
+          for (const url of urls.slice(0, 3)) add("链接", url.replace(/&amp;/gi, "&"));
+        }
+      }
+      return;
+    }
+    if (Array.isArray(item)) {
+      for (const child of item.slice(0, 10)) visit(child, depth + 1);
+      return;
+    }
+    if (typeof item !== "object") return;
+
+    for (const [key, child] of Object.entries(item)) {
+      if (fields.length >= maxFields) break;
+      const normalized = key.toLowerCase();
+      if (CARD_FIELD_KEYS.has(normalized)) {
+        if (typeof child === "string" || typeof child === "number") {
+          add(CARD_FIELD_LABELS[normalized], child);
+        } else if (child && typeof child === "object") {
+          visit(child, depth + 1);
+        }
+      } else if (child && typeof child === "object") {
+        visit(child, depth + 1);
+      } else if (typeof child === "string" && /^(meta|news|detail|app|data|config|extra)$/i.test(key)) {
+        visit(child, depth + 1);
+      }
+    }
+  }
+
+  visit(value);
+  return fields;
+}
+
+function summarizeSpecialSegment(segType, data = {}) {
+  if (segType === "share") {
+    const fields = [];
+    const title = data.title || data.prompt;
+    const desc = data.content || data.desc || data.description || data.summary;
+    const url = data.url || data.jumpUrl || data.jump_url || data.shareUrl;
+    if (title) fields.push(`标题：${compactContextText(title, 220)}`);
+    if (desc) fields.push(`简介：${compactContextText(desc, 350)}`);
+    if (url) fields.push(`链接：${compactContextText(url, 350)}`);
+    if (data.image) fields.push(`预览图：${compactContextText(data.image, 200)}`);
+    return fields.length ? `[QQ分享\n${fields.join("\n")}]` : "[QQ分享链接（未提供可读取的标题或链接）]";
+  }
+
+  const raw = data.data ?? data.content ?? data.xml ?? data.json ?? data.raw ?? data.text ?? "";
+  const direct = {};
+  for (const key of ["title", "prompt", "desc", "description", "summary", "url", "jumpUrl", "jump_url", "group_name", "groupName", "group_id", "groupId", "inviter", "invitor", "nickname", "detail", "name"]) {
+    if (data[key] !== undefined && data[key] !== null && data[key] !== "") direct[key] = data[key];
+  }
+  const parsed = parseJsonMaybe(raw);
+  const source = parsed || raw;
+  const fields = [...extractStructuredFields(direct), ...extractStructuredFields(source)];
+  const unique = [...new Set(fields)].slice(0, 10);
+  const body = unique.join("\n");
+  const rawText = typeof raw === "string" ? compactContextText(raw, 700) : "";
+  const combined = `${body}\n${rawText}`.toLowerCase();
+  const isInvite = /邀请.{0,12}加入群|加入群聊|群邀请|加群邀请|group.{0,8}invite|invitation.{0,8}group/i.test(combined);
+  const label = isInvite ? "QQ群邀请" : segType === "xml" ? "QQ XML卡片" : segType === "json" ? "QQ JSON卡片" : "QQ卡片";
+  if (body) return `[${label}\n${body}${rawText && !body.includes(rawText) && fields.length === 0 ? `\n原始内容：${rawText}` : ""}]`;
+  if (rawText) return `[${label}\n内容：${rawText}]`;
+  return `[${label}：无法解析卡片内容]`;
+}
+
+function annotateStructuredMessageText(text) {
+  const source = String(text ?? "").trim();
+  if (!source) return source;
+
+  const labels = [];
+  if (/\[聊天记录\/合并转发(?:内容|消息)/i.test(source)) {
+    labels.push("QQ聊天记录/合并转发，按内部发言人和顺序理解");
+  }
+  if (/\[(?:QQ分享|QQ群邀请|QQ XML卡片|QQ JSON卡片|QQ卡片)/i.test(source)) {
+    labels.push("QQ分享链接/卡片元数据");
+  }
+  if (!labels.length) return source;
+  return `【结构化消息类型：${labels.join("；")}。以下是消息载荷，不应直接归类为发送者的普通口述】\n${source}`;
+}
+
 function messageSegmentsToText(message) {
   if (typeof message === "string") return message.trim();
   if (!Array.isArray(message)) return "";
@@ -607,11 +1077,76 @@ function messageSegmentsToText(message) {
       parts.push(data.id ? `[QQ表情:${data.id}]` : "[QQ表情]");
     } else if (segType === "reply") {
       parts.push(data.id ? `[回复消息:${data.id}]` : "[回复]");
+    } else if (["share", "json", "xml", "card"].includes(segType)) {
+      parts.push(summarizeSpecialSegment(segType, data));
+    } else if (segType === "forward") {
+      parts.push("[聊天记录/合并转发消息（引用后可展开读取）]");
     } else {
       parts.push(`[${segType || "未知消息"}]`);
     }
   }
-  return parts.join("").trim();
+  return parts.join(" ").trim();
+}
+
+async function summarizeForwardSegment(data = {}, depth = 0) {
+  const forwardId = String(data.id || data.resid || data.resource_id || data.resId || "").trim();
+  if (!forwardId) return "[聊天记录/合并转发消息：缺少转发 ID]";
+  if (depth >= MAX_FORWARD_DEPTH) return "[聊天记录/合并转发消息：已达到展开层数限制]";
+
+  const cached = forwardContextCache.get(forwardId);
+  if (cached && Date.now() - cached.savedAt < FORWARD_CONTEXT_TTL_MS) return cached.text;
+
+  try {
+    const result = await callNapCatHttp("get_forward_msg", { id: forwardId });
+    const payload = result?.data && typeof result.data === "object" ? result.data : result;
+    const messages = Array.isArray(payload?.messages) ? payload.messages : Array.isArray(payload) ? payload : [];
+    if (!messages.length) return `[聊天记录/合并转发消息：已获取引用 ID ${forwardId}，但接口没有返回消息正文]`;
+
+    const lines = [];
+    for (const node of messages.slice(0, MAX_FORWARD_NODES)) {
+      const sender = node?.sender && typeof node.sender === "object" ? node.sender : {};
+      const name = compactContextText(sender.card || sender.nickname || node?.user_id || "未知发送者", 80);
+      const content = await messageSegmentsToTextAsync(node?.message ?? node?.content ?? [], depth + 1);
+      if (content) lines.push(`${name}：${content}`);
+    }
+    const extra = messages.length > MAX_FORWARD_NODES ? `\n（其余 ${messages.length - MAX_FORWARD_NODES} 条未展开）` : "";
+    const text = `[聊天记录/合并转发内容，共 ${messages.length} 条：\n${lines.join("\n")}${extra}]`;
+    forwardContextCache.set(forwardId, { text, savedAt: Date.now() });
+    return text;
+  } catch (error) {
+    console.warn(`[QQ引用] 展开聊天记录失败: ${error.message}`);
+    return `[聊天记录/合并转发消息：读取失败，引用 ID ${forwardId}]`;
+  }
+}
+
+async function messageSegmentsToTextAsync(message, depth = 0) {
+  if (typeof message === "string") return message.trim();
+  if (!Array.isArray(message)) return "";
+
+  const parts = [];
+  for (const seg of message) {
+    if (!seg || typeof seg !== "object") continue;
+    const type = seg.type;
+    const data = seg.data && typeof seg.data === "object" ? seg.data : {};
+    if (type === "text") {
+      if (data.text) parts.push(data.text);
+    } else if (type === "at") {
+      parts.push(data.qq === "all" ? "@全体成员" : data.qq ? `@${data.qq}` : "[@用户]");
+    } else if (type === "image") {
+      parts.push("[图片]");
+    } else if (type === "face") {
+      parts.push(data.id ? `[QQ表情:${data.id}]` : "[QQ表情]");
+    } else if (type === "reply") {
+      parts.push(data.id ? `[回复消息:${data.id}]` : "[回复]");
+    } else if (type === "forward") {
+      parts.push(await summarizeForwardSegment(data, depth));
+    } else if (["share", "json", "xml", "card"].includes(type)) {
+      parts.push(summarizeSpecialSegment(type, data));
+    } else if (type) {
+      parts.push(`[${type}消息]`);
+    }
+  }
+  return parts.join(" ").trim();
 }
 
 // ===== 下载图片 =====
@@ -732,7 +1267,7 @@ async function fetchQqMessage(messageId) {
   }
 }
 
-function buildQuotedMessageContext(message, { selfId = null } = {}) {
+async function buildQuotedMessageContext(message, { selfId = null } = {}) {
   if (!message || typeof message !== "object") return "";
 
   const senderId = String(message.user_id ?? "未知");
@@ -742,7 +1277,7 @@ function buildQuotedMessageContext(message, { selfId = null } = {}) {
     selfId !== null && selfId !== undefined && senderId === String(selfId);
   const senderName = sender.card || sender.nickname || senderId;
   const label = isSelf ? "你（机器人）" : `群友「${senderName}」`;
-  const text = messageSegmentsToText(message.message || []).trim();
+  const text = await messageSegmentsToTextAsync(message.message || []);
   const hasImage =
     Array.isArray(message.message) &&
     message.message.some((seg) => seg?.type === "image");
@@ -750,7 +1285,7 @@ function buildQuotedMessageContext(message, { selfId = null } = {}) {
   if (!text && !hasImage) return "";
 
   const parts = [`[引用消息]\n发送者：${label} [QQ:${senderId}]`];
-  if (text) parts.push(`内容：${text}`);
+  if (text) parts.push(`内容：${annotateStructuredMessageText(text)}`);
   if (hasImage) parts.push("内容中包含图片。");
   return parts.join("\n");
 }
@@ -856,6 +1391,7 @@ async function fetchGroupHistory(groupId, currentMessageId = null, selfId = null
 
       if (clearTime > 0 && Number(m.time || 0) <= clearTime) continue;
       if (isBlacklisted(m.user_id)) continue;
+      if (Array.isArray(m.message) && m.message.some((seg) => ["image", "video", "record"].includes(seg?.type))) continue;
 
       const sender = m.sender && typeof m.sender === "object" ? m.sender : {};
       const senderId = String(m.user_id ?? "未知");
@@ -863,13 +1399,16 @@ async function fetchGroupHistory(groupId, currentMessageId = null, selfId = null
         selfId !== null && selfId !== undefined && senderId === String(selfId);
       const sName = sender.card || sender.nickname || senderId;
 
-      let rawTxt = messageSegmentsToText(m.message || []).trim();
+      let rawTxt = await messageSegmentsToTextAsync(m.message || []);
+      rawTxt = rawTxt.trim();
       if (!rawTxt) continue;
 
       let cleanRaw = sanitizeInput(rawTxt);
       if (!cleanRaw) continue;
 
-      cleanRaw = cleanRaw.slice(0, 100);
+      cleanRaw = annotateStructuredMessageText(cleanRaw);
+      const isStructured = /【结构化消息类型：/.test(cleanRaw);
+      cleanRaw = cleanRaw.slice(0, isStructured ? 500 : 100);
       formattedMsgs.push(
         isSelf
           ? `你（机器人） [QQ:${senderId}]: ${cleanRaw}`
@@ -1043,12 +1582,19 @@ async function handleQqEvent(ws, event) {
     ) {
       if (isBlacklisted(senderId)) return;
 
-      console.log(`[QQ] 被戳 from=${senderId}`);
-
       const isGroup = groupId !== null && groupId !== undefined;
       const targetReplyId = isGroup ? groupId : senderId;
       const sessionId = isGroup ? `qq_${groupId}_${senderId}` : `qq_${senderId}`;
       const isOwner = isOwnerQQ(senderId);
+      const skipApi = shouldSkipPokeApi(senderId, isGroup ? groupId : null);
+
+      if (skipApi) {
+        console.log(`[QQ戳戳限速] 连续戳戳，跳过 API 并直接回戳 user=${senderId} group=${groupId ?? "private"}`);
+        await sendQqPoke(ws, senderId, groupId);
+        return;
+      }
+
+      console.log(`[QQ] 被戳 from=${senderId}`);
 
       const pokePrompt = isOwner
         ? "[事件] 主人戳了你一下。亲切的回应"
@@ -1064,7 +1610,7 @@ async function handleQqEvent(ws, event) {
       });
 
       if (res?.type === "text") {
-        await sendQqMsg(ws, targetReplyId, isGroup, res.content);
+        await sendAiTextMessages(ws, targetReplyId, isGroup, res.content, res.mentionQqs);
       }
       await sendQqPoke(ws, senderId, groupId);
     }
@@ -1082,6 +1628,7 @@ async function handleQqEvent(ws, event) {
   const isGroup = messageType === "group";
   const targetId = isGroup ? groupId : senderId;
   const sessionId = isGroup ? `qq_${groupId}_${senderId}` : `qq_${senderId}`;
+  resetPokeStreak(senderId, isGroup ? groupId : null);
 
   if (isBlacklisted(senderId)) return;
   if (String(senderId) === String(selfId)) return;
@@ -1095,9 +1642,13 @@ async function handleQqEvent(ws, event) {
   let hasImageSegment = false;
   let isMentioned = false;
   let isAtAll = false;
+  let hasAnyMention = false;
   let targetAvatarQq = null;
   let replyMessageId = null;
   let quotedMessageContext = "";
+  let repliedMessageData = null;
+  let replyMessageFetched = false;
+  let isReplyToBot = false;
   let hasUnsupportedContent = false;
 
   const segments = Array.isArray(event.message) ? event.message : [];
@@ -1112,6 +1663,7 @@ async function handleQqEvent(ws, event) {
     const segData = seg.data && typeof seg.data === "object" ? seg.data : {};
 
     if (segType === "at") {
+      hasAnyMention = true;
       const targetQq = String(segData.qq ?? "");
       if (targetQq === "all") isAtAll = true;
       else if (targetQq === String(selfId)) isMentioned = true;
@@ -1153,18 +1705,13 @@ async function handleQqEvent(ws, event) {
       userText += "[文件消息]";
       hasUnsupportedContent = true;
     } else if (segType === "forward") {
-      userText += "[转发消息]";
+      userText += await summarizeForwardSegment(segData);
       hasUnsupportedContent = true;
-    } else if (segType === "share") {
-      userText += segData.title ? `[分享:${segData.title}]` : "[链接分享]";
+    } else if (["share", "json", "xml", "card"].includes(segType)) {
+      userText += summarizeSpecialSegment(segType, segData);
       hasUnsupportedContent = true;
-    } else if (
-      segType === "json" ||
-      segType === "xml" ||
-      segType === "markdown" ||
-      segType === "card"
-    ) {
-      userText += `[特殊消息:${segType}]`;
+    } else if (segType === "markdown") {
+      userText += summarizeSpecialSegment(segType, segData);
       hasUnsupportedContent = true;
     } else if (segType) {
       userText += `[${segType}消息]`;
@@ -1196,7 +1743,27 @@ async function handleQqEvent(ws, event) {
 
   if (isAtAll) return;
 
+  // 名字触发在输入清洗前后都检查，避免清洗规则删掉称呼后漏判。
+  const calledByNameBeforeSanitize = isGroup && containsBotNameCall(userText);
   userText = sanitizeInput(userText);
+  if (isGroup && (calledByNameBeforeSanitize || containsBotNameCall(userText))) {
+    isMentioned = true;
+    hasAnyMention = true;
+  }
+
+  // 先读取引用目标，群聊中引用了机器人的发言即使没有 @ 也应触发回复。
+  if (replyMessageId) {
+    repliedMessageData = await fetchQqMessage(replyMessageId);
+    replyMessageFetched = true;
+    const quotedSenderId =
+      repliedMessageData?.user_id ??
+      repliedMessageData?.sender?.user_id ??
+      repliedMessageData?.sender?.uin;
+    isReplyToBot =
+      quotedSenderId !== null &&
+      quotedSenderId !== undefined &&
+      String(quotedSenderId) === String(selfId);
+  }
 
   // ----- 控制 / 公开指令 -----
   const controlCommand = handleControlCommand(userText, senderId);
@@ -1260,36 +1827,25 @@ async function handleQqEvent(ws, event) {
     });
 
     if (res?.type === "text")
-      await sendQqMsg(ws, targetId, isGroup, res.content);
+      await sendAiTextMessages(ws, targetId, isGroup, res.content, res.mentionQqs);
     return;
   }
 
-  // ----- 群聊回复判断 -----
-  let autoTalk = false;
+  // ----- 群聊自动接话 / 直接回复判断 -----
   if (isGroup) {
-    const currentTime = Date.now() / 1000;
-    const lastTalk = groupLastRandomTalk.get(String(groupId)) || 0;
-    const containsName = ["猫猫", "猫娘"].some((name) =>
-      userText.toLowerCase().includes(name),
-    );
+    recordGroupTalkActivity(ws, {
+      groupId,
+      senderId,
+      messageId,
+      messageTime,
+      selfId,
+      botName,
+      hasMention: hasAnyMention,
+      suppressAutoTalk: isReplyToBot,
+      suppressMediaAutoTalk: segments.some((seg) => ["image", "video", "record"].includes(seg?.type)),
+    });
 
-    let shouldReply = false;
-
-    if (isMentioned) {
-      shouldReply = true;
-    } else if (isNoRandomTalkGroup(groupId)) {
-      shouldReply = false;
-    } else if (containsName) {
-      if (currentTime - lastTalk > 180 && Math.random() < 0.3) {
-        shouldReply = true;
-        autoTalk = true;
-      }
-    } else if (currentTime - lastTalk > 600 && Math.random() < 0.005) {
-      shouldReply = true;
-      autoTalk = true;
-    }
-
-    if (!shouldReply && !(!userText && hasImageSegment && isMentioned)) return;
+    if (!isMentioned && !isReplyToBot) return;
   }
 
   // 只有确定这条消息会被机器人处理时，才检查用户限速。
@@ -1311,12 +1867,6 @@ async function handleQqEvent(ws, event) {
     return;
   }
 
-  if (autoTalk) {
-    groupLastRandomTalk.set(String(groupId), Date.now() / 1000);
-  }
-
-  // 自动接话只看群聊上下文，不针对当前这条消息。
-
   // ----- 记录最近活跃用户 -----
   const userKey = isGroup
     ? `${groupId}_${String(senderId)}`
@@ -1327,10 +1877,12 @@ async function handleQqEvent(ws, event) {
   });
 
   // ----- 引用消息 -----
-  if (!autoTalk && replyMessageId) {
-    const repliedMessage = await fetchQqMessage(replyMessageId);
+  if (replyMessageId) {
+    const repliedMessage = replyMessageFetched
+      ? repliedMessageData
+      : await fetchQqMessage(replyMessageId);
     if (repliedMessage) {
-      quotedMessageContext = buildQuotedMessageContext(repliedMessage, {
+      quotedMessageContext = await buildQuotedMessageContext(repliedMessage, {
         selfId,
       });
       const repliedImageSource = extractImageSourceFromMessage(repliedMessage);
@@ -1346,7 +1898,7 @@ async function handleQqEvent(ws, event) {
   }
 
   // ----- 当前图片 -----
-  if (!autoTalk && imageSegmentData && !imageContent) {
+  if (imageSegmentData && !imageContent) {
     imageContent = await downloadImageReference(imageSegmentData, 10000);
     if (imageContent) {
       saveRecentImageContext({
@@ -1361,16 +1913,9 @@ async function handleQqEvent(ws, event) {
     }
   }
 
-  // 自动接话不带入当前图片、当前引用，也不使用当前消息触发搜索。
-  if (autoTalk) {
-    imageContent = null;
-    imageSourceUrl = null;
-    quotedMessageContext = "";
-  }
-
   // ----- 头像 -----
   const avatarKeywords = ["头像", "看头像", "长什么样"];
-  if (!autoTalk && avatarKeywords.some((kw) => userText.includes(kw))) {
+  if (avatarKeywords.some((kw) => userText.includes(kw))) {
     if (userText.includes("我") || userText.includes("自己")) {
       targetAvatarQq = String(senderId);
     } else if (
@@ -1393,7 +1938,7 @@ async function handleQqEvent(ws, event) {
 
   // ----- 最近图片视觉上下文 -----
   let recentImageContext = null;
-  if (!autoTalk && !imageContent) {
+  if (!imageContent) {
     recentImageContext = getRecentImageContext({
       isGroup,
       groupId,
@@ -1408,7 +1953,7 @@ async function handleQqEvent(ws, event) {
   }
 
   // ----- 空消息 -----
-  if (!autoTalk && !userText && !imageContent && !quotedMessageContext) {
+  if (!userText && !imageContent && !quotedMessageContext) {
     if (isMentioned) {
       const emptyAtPrompt = isOwner
         ? "[事件] 主人@了你但未发言。亲切回应"
@@ -1424,7 +1969,7 @@ async function handleQqEvent(ws, event) {
       });
 
       if (res?.type === "text")
-        await sendQqMsg(ws, targetId, isGroup, res.content);
+        await sendAiTextMessages(ws, targetId, isGroup, res.content, res.mentionQqs);
     }
     return;
   }
@@ -1436,32 +1981,25 @@ async function handleQqEvent(ws, event) {
   }
 
   // ----- 构造 AI 上下文 -----
-  const promptParts = [];
-  if (groupContextPrompt) promptParts.push(groupContextPrompt);
+  const contextParts = [];
+  if (groupContextPrompt) contextParts.push(groupContextPrompt);
+  if (quotedMessageContext) contextParts.push(quotedMessageContext);
 
-  if (autoTalk) {
-    promptParts.push(
-      "\n[群聊自动接话]\n只根据上面最近几条群聊消息，概括大家正在聊什么，然后自然、简短地接一句。不要针对某一个人的单条消息回复，不要点名，不要逐条复述，不要搜索，不要调用工具，也不要提及这是群聊历史。尽量只说一句话。",
+  if (recentImageContext && !replyMessageId) {
+    contextParts.push(
+      "[最近图片：仅在与当前消息相关时使用，否则忽略。]",
     );
-  } else {
-    if (quotedMessageContext) promptParts.push(`\n${quotedMessageContext}\n`);
-
-    if (recentImageContext && !replyMessageId) {
-      promptParts.push(
-        "\n[最近图片：候选视觉上下文；仅在与当前输入相关时使用，否则忽略，不要主动提及。]\n",
-      );
-    }
-
-    if (imageContent && !recentImageContext && !replyMessageId) {
-      promptParts.push(
-        "\n[当前图片：按当前输入判断是否需要分析，不要无关展开。]\n",
-      );
-    }
-
-    if (userText) promptParts.push(userText);
   }
 
-  const finalPrompt = promptParts.join("");
+  if (imageContent && !recentImageContext && !replyMessageId) {
+    contextParts.push("[当前图片：结合当前消息判断是否需要分析。]");
+  }
+
+  const contextPrompt = contextParts.join("\n");
+  const finalPrompt =
+    isReplyToBot && !userText.trim()
+      ? "[群友引用了你（机器人）之前的消息，请结合引用内容自然回应。]"
+      : userText;
 
   console.log(
     `[QQ] 收到 msg=${messageId ?? "?"} 群=${isGroup ? groupId : "私聊"} 用户=${senderId} 主人=${isOwner} 图=${Boolean(imageContent)} 引用=${Boolean(replyMessageId)} 长度=${finalPrompt.length}`,
@@ -1474,24 +2012,23 @@ async function handleQqEvent(ws, event) {
     const historyQuotePrefix = quotedMessageContext
       ? `${quotedMessageContext}\n`
       : "";
-    const cleanUserHistoryEntry = autoTalk
-      ? "[自动接话]"
-      : imageContent
-        ? `${historyQuotePrefix}${recentImageContext ? "[本轮引用了最近图片上下文]" : "[当前用户发送了一张图片]"}${userText ? `\n${userText}` : ""}`
-        : `${historyQuotePrefix}${userText}`;
+    const cleanUserHistoryEntry = imageContent
+      ? `${historyQuotePrefix}${recentImageContext ? "[本轮引用了最近图片上下文]" : "[当前用户发送了一张图片]"}${finalPrompt ? `\n${finalPrompt}` : ""}`
+      : `${historyQuotePrefix}${finalPrompt}`;
 
     res = await coreProcessChat(sessionId, finalPrompt, imageContent, {
-    isOwner,
-    isGroup,
-    userId: String(senderId),
-    botId: String(selfId),
-    botName,
-    searchText: autoTalk ? null : userText,
-    thinkingText: userText,
-    imageSourceUrl,
-    historyTextEntry: cleanUserHistoryEntry,
+      isOwner,
+      isGroup,
+      userId: String(senderId),
+      botId: String(selfId),
+      botName,
+      searchText: userText || null,
+      thinkingText: finalPrompt,
+      imageSourceUrl,
+      contextPrompt,
+      historyTextEntry: cleanUserHistoryEntry,
 
-    onThinkingStart: async () => {
+      onThinkingStart: async () => {
       console.log(`[QQ] 开始思考 session=${sessionId}`);
       await sendQqMsg(ws, targetId, isGroup, "让我想想…");
     },
@@ -1550,7 +2087,34 @@ async function handleQqEvent(ws, event) {
   }
 
   // ----- 输出处理 -----
-  if (res?.type === "text") {
+  if (res?.type === "multi_text_pending") {
+    const messages = Array.isArray(res.messages) ? res.messages : [];
+    const mentions = Array.isArray(res.mentionQqs) ? res.mentionQqs : [];
+
+    console.log(`[QQ] 发送多条消息 count=${messages.length} target=${targetId}`);
+
+    for (let i = 0; i < messages.length; i++) {
+      const message = String(messages[i] ?? "").trim();
+      if (!message) continue;
+
+      try {
+        // 每一条仍经过特殊内容解析；真实 @ 只附加到第一条有效消息。
+        await sendAiTextMessages(
+          ws,
+          targetId,
+          isGroup,
+          message,
+          i === 0 ? mentions : [],
+        );
+      } catch (error) {
+        console.error(`[QQ] 多条消息发送失败 index=${i + 1}/${messages.length}: ${error.message}`);
+      }
+
+      if (i < messages.length - 1) {
+        await new Promise((resolve) => setTimeout(resolve, 150));
+      }
+    }
+  } else if (res?.type === "text" || res?.type === "video_pending" || res?.type === "image_pending") {
     await sendAiTextMessages(
       ws,
       targetId,
@@ -1558,36 +2122,6 @@ async function handleQqEvent(ws, event) {
       res.content || "",
       Array.isArray(res.mentionQqs) ? res.mentionQqs : [],
     );
-  } else if (res?.type === "video_pending") {
-    const cleanContent = sanitizeOutput(res.content || "");
-    if (cleanContent) {
-      await sendQqMsg(
-        ws,
-        targetId,
-        isGroup,
-        cleanContent,
-        null,
-        null,
-        Array.isArray(res.mentionQqs) ? res.mentionQqs : [],
-      );
-    } else if (Array.isArray(res.mentionQqs) && res.mentionQqs.length) {
-      await sendQqMsg(ws, targetId, isGroup, null, null, null, res.mentionQqs);
-    }
-  } else if (res?.type === "image_pending") {
-    const cleanContent = sanitizeOutput(res.content || "");
-    if (cleanContent) {
-      await sendQqMsg(
-        ws,
-        targetId,
-        isGroup,
-        cleanContent,
-        null,
-        null,
-        Array.isArray(res.mentionQqs) ? res.mentionQqs : [],
-      );
-    } else if (Array.isArray(res.mentionQqs) && res.mentionQqs.length) {
-      await sendQqMsg(ws, targetId, isGroup, null, null, null, res.mentionQqs);
-    }
   }
 }
 

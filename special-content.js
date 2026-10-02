@@ -61,24 +61,41 @@ async function napcatApi(action, params = {}) {
   return await response.json();
 }
 
+function normalizeMentions(mentionQqs, isGroup = true) {
+  if (!isGroup || !Array.isArray(mentionQqs)) return [];
+  return [...new Set(mentionQqs
+    .map((value) => String(value ?? "").trim())
+    .filter((value) => value === "all" || /^\d{5,12}$/.test(value)))];
+}
+
+function makeTextSegments(text, mentionQqs = []) {
+  const mentions = normalizeMentions(mentionQqs);
+  const segments = mentions.map((qq) => ({
+    type: "at",
+    data: { qq },
+  }));
+  const value = String(text ?? "");
+  if (value) {
+    segments.push({
+      type: "text",
+      data: { text: `${mentions.length ? " " : ""}${value}` },
+    });
+  }
+  return segments;
+}
+
 function makeForwardNode(
   content,
   senderName = BOT_NICKNAME,
   senderId = BOT_QQ,
+  mentionQqs = [],
 ) {
   return {
     type: "node",
     data: {
       name: senderName,
       uin: String(senderId),
-      content: [
-        {
-          type: "text",
-          data: {
-            text: content,
-          },
-        },
-      ],
+      content: makeTextSegments(content, mentionQqs),
     },
   };
 }
@@ -105,54 +122,30 @@ async function sendForwardMessage(targetId, isGroup, nodes) {
   await napcatApi(action, params);
 }
 
-async function sendPlainText(targetId, isGroup, text) {
-  if (!text) {
-    return;
-  }
-
-  const cleaned = String(text).replace(/^[\r\n]+|[\r\n]+$/g, "");
-
-  if (!cleaned) {
-    return;
-  }
+async function sendPlainText(targetId, isGroup, text, mentionQqs = []) {
+  const cleaned = String(text ?? "").replace(/^[\r\n]+|[\r\n]+$/g, "");
+  const mentions = normalizeMentions(mentionQqs, isGroup);
+  if (!cleaned && !mentions.length) return;
 
   const action = isGroup ? "send_group_msg" : "send_private_msg";
-
   const key = isGroup ? "group_id" : "user_id";
 
   await napcatApi(action, {
     [key]: targetId,
-    message: [
-      {
-        type: "text",
-        data: {
-          text: cleaned,
-        },
-      },
-    ],
+    message: makeTextSegments(cleaned, mentions),
   });
 }
 
-async function sendImage(targetId, isGroup, imageBase64) {
-  if (!imageBase64) {
-    return;
-  }
+async function sendImage(targetId, isGroup, imageBase64, mentionQqs = []) {
+  if (!imageBase64) return;
+  const mentions = normalizeMentions(mentionQqs, isGroup);
+  const message = makeTextSegments("", mentions);
+  if (mentions.length) message.push({ type: "text", data: { text: " " } });
+  message.push({ type: "image", data: { file: `base64://${imageBase64}` } });
 
   const action = isGroup ? "send_group_msg" : "send_private_msg";
-
   const key = isGroup ? "group_id" : "user_id";
-
-  await napcatApi(action, {
-    [key]: targetId,
-    message: [
-      {
-        type: "image",
-        data: {
-          file: `base64://${imageBase64}`,
-        },
-      },
-    ],
-  });
+  await napcatApi(action, { [key]: targetId, message });
 }
 
 async function sendRichBlock(
@@ -160,6 +153,7 @@ async function sendRichBlock(
   isGroup,
   markdown,
   fallbackCode = markdown,
+  mentionQqs = [],
 ) {
   if (!markdown || !markdown.trim()) {
     return;
@@ -171,16 +165,16 @@ async function sendRichBlock(
     if (!imageBase64) {
       console.error("[SpecialContent] rich 渲染失败，降级代码块");
 
-      await sendCodeBlock(targetId, isGroup, fallbackCode);
+      await sendCodeBlock(targetId, isGroup, fallbackCode, mentionQqs);
 
       return;
     }
 
-    await sendImage(targetId, isGroup, imageBase64);
+    await sendImage(targetId, isGroup, imageBase64, mentionQqs);
   } catch (error) {
     console.error("[SpecialContent] rich 发送失败，降级代码块:", error);
 
-    await sendCodeBlock(targetId, isGroup, fallbackCode);
+    await sendCodeBlock(targetId, isGroup, fallbackCode, mentionQqs);
   }
 }
 
@@ -514,7 +508,7 @@ ${code}
   return code;
 }
 
-async function sendLatexCodeBlock(targetId, isGroup, block) {
+async function sendLatexCodeBlock(targetId, isGroup, block, mentionQqs = []) {
   /*
    * getBlockCode() 会在这里自动进行一次
    * “损坏 LaTeX 反斜杠恢复”。
@@ -533,6 +527,7 @@ async function sendLatexCodeBlock(targetId, isGroup, block) {
 ${code}
 $$`,
       code,
+      mentionQqs,
     );
 
     return;
@@ -544,20 +539,20 @@ $$`,
     if (!imageBase64) {
       console.error("[SpecialContent] 完整 LaTeX 编译器不可用，降级代码块");
 
-      await sendCodeBlock(targetId, isGroup, code);
+      await sendCodeBlock(targetId, isGroup, code, mentionQqs);
 
       return;
     }
 
-    await sendImage(targetId, isGroup, imageBase64);
+    await sendImage(targetId, isGroup, imageBase64, mentionQqs);
   } catch (error) {
     console.error("[SpecialContent] 完整 LaTeX 编译失败，降级代码块:", error);
 
-    await sendCodeBlock(targetId, isGroup, code);
+    await sendCodeBlock(targetId, isGroup, code, mentionQqs);
   }
 }
 
-async function sendCodeBlock(targetId, isGroup, code) {
+async function sendCodeBlock(targetId, isGroup, code, mentionQqs = []) {
   if (!code) {
     return;
   }
@@ -569,13 +564,12 @@ async function sendCodeBlock(targetId, isGroup, code) {
   }
 
   const nodes = [];
+  let pendingMentions = normalizeMentions(mentionQqs, isGroup);
 
   for (const chunk of chunks) {
-    if (!chunk) {
-      continue;
-    }
-
-    nodes.push(makeForwardNode(chunk));
+    if (!chunk) continue;
+    nodes.push(makeForwardNode(chunk, BOT_NICKNAME, BOT_QQ, pendingMentions));
+    pendingMentions = [];
   }
 
   await sendForwardMessage(targetId, isGroup, nodes);
@@ -630,7 +624,7 @@ function splitMessages(text) {
  * 普通消息里的 $...$、$$...$$、**加粗**、标题、列表等
  * 不再触发任何图片渲染。
  */
-async function sendSpecialContent(targetId, isGroup, text) {
+async function sendSpecialContent(targetId, isGroup, text, mentionQqs = []) {
   if (!text) {
     return;
   }
@@ -641,10 +635,11 @@ async function sendSpecialContent(targetId, isGroup, text) {
     return;
   }
 
-  for (const message of messages) {
-    if (!message || !message.trim()) {
-      continue;
-    }
+  let pendingMentions = normalizeMentions(mentionQqs, isGroup);
+
+  for (let messageIndex = 0; messageIndex < messages.length; messageIndex++) {
+    const message = messages[messageIndex];
+    if (!message || !message.trim()) continue;
 
     const blocks = parseMessageBlocks(message);
 
@@ -654,7 +649,8 @@ async function sendSpecialContent(targetId, isGroup, text) {
 
     for (const block of blocks) {
       if (block.type === "text") {
-        await sendPlainText(targetId, isGroup, block.text);
+        await sendPlainText(targetId, isGroup, block.text, pendingMentions);
+        pendingMentions = [];
 
         continue;
       }
@@ -670,7 +666,8 @@ async function sendSpecialContent(targetId, isGroup, text) {
        * 只有被代码块包裹的内容才会进入图片渲染流程。
        */
       if (block.type === "markdown") {
-        await sendPlainText(targetId, isGroup, block.markdown);
+        await sendPlainText(targetId, isGroup, block.markdown, pendingMentions);
+        pendingMentions = [];
 
         continue;
       }
@@ -680,7 +677,8 @@ async function sendSpecialContent(targetId, isGroup, text) {
          * 非白名单语言的代码块 → 走转发，不渲染图片。
          */
         if (!isRichCodeBlock(block)) {
-          await sendCodeBlock(targetId, isGroup, block.code);
+          await sendCodeBlock(targetId, isGroup, block.code, pendingMentions);
+          pendingMentions = [];
 
           continue;
         }
@@ -689,7 +687,8 @@ async function sendSpecialContent(targetId, isGroup, text) {
          * LaTeX 代码块 → 专用渲染通道。
          */
         if (isLatexCodeBlock(block)) {
-          await sendLatexCodeBlock(targetId, isGroup, block);
+          await sendLatexCodeBlock(targetId, isGroup, block, pendingMentions);
+          pendingMentions = [];
 
           continue;
         }
@@ -706,11 +705,17 @@ async function sendSpecialContent(targetId, isGroup, text) {
             isGroup,
             richContent,
             fallbackCode,
+            pendingMentions,
           );
+          pendingMentions = [];
         }
 
         continue;
       }
+    }
+
+    if (messageIndex < messages.length - 1) {
+      await new Promise((resolve) => setTimeout(resolve, 80));
     }
   }
 }
