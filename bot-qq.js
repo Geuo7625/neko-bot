@@ -4,8 +4,8 @@ import WebSocket from "ws";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
-import { NAPCAT_WS_URL, NAPCAT_HTTP_URL, NAPCAT_TOKEN } from "./config.js";
-import { coreProcessChat, clearHistory, clearAllHistories } from "./core.js";
+import { NAPCAT_WS_URL, NAPCAT_HTTP_URL, NAPCAT_TOKEN, RUNTIME_CONFIG } from "./config.js";
+import { coreProcessChat, clearHistory, clearAllHistories, clearContextRequests } from "./core.js";
 import { sendSpecialContent } from "./special-content.js";
 import { handleControlCommand } from "./control.js";
 import {
@@ -13,11 +13,14 @@ import {
   checkServerStatusRateLimit,
 } from "./server-status.js";
 import { IMAGE_SOURCE } from "./image-provenance.js";
+import { scoreMessage } from "./value-score.js";
+import { cleanValueText, shouldEvaluateMessage, shouldAskAiAboutMessage, evaluateMessageValue, combineMessageValue } from "./message-value.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const BOT_CONFIG_PATH = path.join(__dirname, "bot-config.json");
+const GROUP_HISTORY_CLEAR_PATH = path.join(__dirname, "group-history-clear.json");
 
 let botConfig = loadBotConfig();
 let botConfigMtime = getConfigMtime();
@@ -28,18 +31,43 @@ const pokeStreakStates = new Map();
 const POKE_STREAK_WINDOW_MS = 60_000;
 const POKE_STREAK_THRESHOLD = 3;
 
-const AUTO_TALK_IDLE_MS = 120_000;
-const AUTO_TALK_ACTIVE_WINDOW_MS = 20_000;
-const AUTO_TALK_ACTIVE_MIN_MESSAGES = 6;
-const AUTO_TALK_ACTIVE_MIN_USERS = 2;
-const AUTO_CHIME_MIN_MESSAGES = 3;
-const AUTO_CHIME_MAX_MESSAGES = AUTO_TALK_ACTIVE_MIN_MESSAGES - 1;
-const AUTO_CHIME_DEBOUNCE_MS = 1800;
-const AUTO_CHIME_CHECK_COOLDOWN_MS = 45_000;
+// 以下自动接话、上下文、评分阈值和 API 限速参数统一从 config.js 的 RUNTIME_CONFIG 读取，支持热重载。
 const AUTO_CHIME_SILENCE_TOKEN = "§NO_CHIME_7F31§";
-const AUTO_TALK_COOLDOWN_MS = 180_000;
 const recentUsers = new Map();
+const recentBotGroupReplies = new Map();
+const privateTypingStates = new Map();
+const botSessionClearGenerations = new Map();
+let botGlobalClearGeneration = 0;
 const groupHistoryClearPoints = new Map();
+const groupHistoryClearVersions = new Map();
+let globalGroupHistoryClearVersion = 0;
+let globalGroupHistoryClearTime = 0;
+
+function loadGroupHistoryClearState() {
+  try {
+    const saved = JSON.parse(fs.readFileSync(GROUP_HISTORY_CLEAR_PATH, "utf8"));
+    globalGroupHistoryClearTime = Number(saved?.globalTime) || 0;
+    if (saved?.groups && typeof saved.groups === "object") {
+      for (const [groupId, time] of Object.entries(saved.groups)) {
+        groupHistoryClearPoints.set(String(groupId), Number(time) || 0);
+      }
+    }
+  } catch {}
+}
+
+function saveGroupHistoryClearState() {
+  try {
+    const payload = {
+      globalTime: globalGroupHistoryClearTime,
+      groups: Object.fromEntries(groupHistoryClearPoints),
+    };
+    fs.writeFileSync(GROUP_HISTORY_CLEAR_PATH, JSON.stringify(payload), "utf8");
+  } catch (error) {
+    console.error(`[群历史] 保存清除边界失败：${error.message}`);
+  }
+}
+
+loadGroupHistoryClearState();
 
 // ===== QQ 用户限速 =====
 const RATE_LIMIT_MIN_INTERVAL_MS = 2000;
@@ -146,6 +174,9 @@ setInterval(() => {
   for (const [key, entry] of forwardContextCache) {
     if (!entry || now - entry.savedAt > FORWARD_CONTEXT_TTL_MS) forwardContextCache.delete(key);
   }
+  for (const [key, entry] of recentBotGroupReplies) {
+    if (!entry || now - entry.at > RUNTIME_CONFIG.botFollowupWindowMs) recentBotGroupReplies.delete(key);
+  }
 }, 60_000);
 
 function getPokeStreakKey(userId, groupId = null) {
@@ -181,7 +212,6 @@ async function sendUserRateLimitReply(ws, targetId, isGroup, userId, type) {
   await sendQqMsg(ws, targetId, isGroup, text);
 }
 
-let globalGroupHistoryClearTime = 0;
 let lastRandomPokeTime = 0;
 
 // ===== 最近图片上下文 =====
@@ -264,12 +294,58 @@ function getGroupTalkState(groupId) {
       lastAutoTalkAt: 0,
       idleTimer: null,
       activeChimeTimer: null,
+      activeChimeForce: false,
+      pendingHighValue: null,
+      pendingHighValueTimer: null,
+      pendingImplicitReply: null,
+      lastForcedChimeAt: 0,
       lastChimeCheckAt: 0,
       autoTalkInFlight: false,
     };
     groupTalkStates.set(key, state);
   }
   return state;
+}
+
+function getRecentBotGroupReply(groupId) {
+  const key = String(groupId);
+  const entry = recentBotGroupReplies.get(key);
+  if (!entry) return null;
+  if (Date.now() - entry.at > RUNTIME_CONFIG.botFollowupWindowMs) {
+    recentBotGroupReplies.delete(key);
+    return null;
+  }
+  return entry;
+}
+
+function noteBotGroupReply(groupId, text) {
+  if (groupId === null || groupId === undefined) return;
+  const clean = String(text ?? "").trim();
+  if (!clean) return;
+  recentBotGroupReplies.set(String(groupId), { at: Date.now(), text: clean.slice(0, 1200) });
+}
+
+function drainPendingGroupTasks(ws, state) {
+  const now = Date.now();
+  const implicit = state.pendingImplicitReply;
+  if (implicit) {
+    state.pendingImplicitReply = null;
+    if (now - Number(implicit.createdAt || now) <= RUNTIME_CONFIG.botFollowupMaxPendingAgeMs) {
+      setTimeout(() => { void performImplicitBotFollowup(ws, implicit); }, 180);
+    } else {
+      console.log(`[群聊隐式回复] 排队超时，忽略 group=${implicit.groupId} msg=${implicit.messageId ?? "?"}`);
+    }
+    return;
+  }
+  const pending = state.pendingHighValue;
+  if (pending && !state.pendingHighValueTimer) {
+    state.pendingHighValue = null;
+    if (now - Number(pending.createdAt || now) <= RUNTIME_CONFIG.autoChimeMaxPendingAgeMs) {
+      setTimeout(() => { void performGroupConversationChime(ws, pending); }, 180);
+    } else {
+      console.log(`[群聊接话] 高价值候选过期，忽略 group=${pending.groupId}`);
+    }
+  }
 }
 
 function clearGroupIdleTimer(state) {
@@ -284,10 +360,7 @@ function clearGroupChimeTimer(state) {
     clearTimeout(state.activeChimeTimer);
     state.activeChimeTimer = null;
   }
-}
-
-function hasRecentGroupMention(groupContextPrompt) {
-  return /@(?:全体成员|\d{5,12})/.test(String(groupContextPrompt || ""));
+  if (state) state.activeChimeForce = false;
 }
 
 async function performGroupAutoTalk(
@@ -300,33 +373,34 @@ async function performGroupAutoTalk(
 
   const state = getGroupTalkState(groupId);
   if (state.autoTalkInFlight) return;
+  const clearGeneration = getGroupHistoryGeneration(groupId);
 
   const now = Date.now();
-  if (now - state.lastAutoTalkAt < AUTO_TALK_COOLDOWN_MS) return;
+  if (now - state.lastAutoTalkAt < RUNTIME_CONFIG.autoTalkCooldownMs) return;
 
-  if (mode === "idle" && state.lastMessageAt && now - state.lastMessageAt < AUTO_TALK_IDLE_MS) {
+  if (mode === "idle" && state.lastMessageAt && now - state.lastMessageAt < RUNTIME_CONFIG.autoTalkIdleMs) {
     return;
   }
 
   state.autoTalkInFlight = true;
   clearGroupIdleTimer(state);
+  const sessionId = `qq_group_${String(groupId)}_auto`;
 
   try {
     const groupContextPrompt = await fetchGroupHistory(
       groupId,
       excludeMessageId,
       selfId,
+      true,
+      { maxAgeMs: mode === "idle" ? RUNTIME_CONFIG.groupIdleHistoryMaxAgeMs : RUNTIME_CONFIG.groupAutoHistoryMaxAgeMs, limit: RUNTIME_CONFIG.maxGroupContextMessages },
     );
-    if (!groupContextPrompt || hasRecentGroupMention(groupContextPrompt)) return;
+    if (getGroupHistoryGeneration(groupId) !== clearGeneration) return;
+    if (!String(groupContextPrompt || "").trim()) return;
 
-    const modePrompt =
-      mode === "active"
-        ? "顺着最近话题说一个简短观点，只说一句。"
-        : "群里安静了两分钟，只说一句很短的话，尽量十几字。";
-    const contextPrompt = `${groupContextPrompt}\n${modePrompt}`;
-    const sessionId = `qq_group_${String(groupId)}_auto`;
+    const modePrompt = buildGroupReplyDecisionPrompt({ mode });
+    const contextPrompt = groupContextPrompt;
 
-    const res = await coreProcessChat(sessionId, "[自动接话]", undefined, {
+    const res = await coreProcessChat(sessionId, modePrompt, undefined, {
       isOwner: false,
       isGroup: true,
       userId: null,
@@ -335,72 +409,126 @@ async function performGroupAutoTalk(
       searchText: null,
       thinkingText: null,
       contextPrompt,
-      allowTools: false,
+      contextKey: `group:${String(groupId)}`,
+      allowTools: true,
+      toolAllowlist: ["get_recent_group_image", "quote_group_message"],
+      getGroupImage: ({ messageId } = {}) => fetchRecentGroupImage(groupId, messageId),
+      isContextCurrent: () => getGroupHistoryGeneration(groupId) === clearGeneration,
+      requestPriority: "auto",
       historyTextEntry: "[自动接话]",
     });
 
+    if (getGroupHistoryGeneration(groupId) !== clearGeneration) return;
     if (res?.type === "text" && res.content) {
-      await sendAiTextMessages(ws, groupId, true, res.content, res.mentionQqs);
+      if (isNoChimeResponse(res.content)) {
+        console.log(`[群聊自动接话] AI 判断无需回应 group=${groupId} mode=${mode}`);
+        return;
+      }
+      await sendAiTextMessages(ws, groupId, true, res.content, res.mentionQqs, res.quoteMessageId);
       state.lastAutoTalkAt = Date.now();
     }
   } catch (error) {
     console.error(`[群聊自动接话] 失败 group=${groupId}: ${error.message}`);
   } finally {
     state.autoTalkInFlight = false;
+    clearHistory(sessionId); // 自动接话的临时判断不进入下一轮历史，群聊上下文每次从 QQ 重新读取。
+    drainPendingGroupTasks(ws, state);
   }
 }
 
 function isNoChimeResponse(text) {
-  return String(text ?? "").trim() === AUTO_CHIME_SILENCE_TOKEN;
+  // 模型即使多带了换行或解释，只要出现控制符就绝不发到 QQ。
+  return String(text ?? "").trim().includes(AUTO_CHIME_SILENCE_TOKEN);
+}
+
+function buildGroupReplyDecisionPrompt({ mode = "conversation", highValue = false, triggerText = "", triggerReasons = [] } = {}) {
+  const situation = mode === "idle"
+    ? "群聊已经安静了一段时间。不要把较早的话题重新捡起来继续；只有在确实能自然开启一个全新、轻松话题时才开口，否则静默。"
+    : mode === "active"
+      ? "群聊正在进行。可以补充一个有意义的观点、回应未解决的问题，或自然接续当前话题。"
+      : "判断最近的群聊是否存在值得你加入的自然切入点。";
+  triggerText = String(triggerText || "");
+  triggerReasons = Array.isArray(triggerReasons) ? triggerReasons : [];
+  const ambiguousCallHint = triggerReasons.some((reason) => ["bot-name", "bot-topic", "short-bot-topic"].includes(reason))
+    && Array.from(triggerText).length <= 40
+    ? "如果触发消息很短，只提到 AI、机器人或你的名字，且你无法确定是不是在叫你，不要直接静默；可以自然地问一句‘你是在叫我吗？可以说清楚一点喵。’如果明显是在讨论第三方或泛泛讨论 AI，则不要误认为是在叫你。"
+    : "";
+  return `【任务：判断是否有必要参与群聊】
+你是群里自然聊天的一员，不是消息播报器。最后一条 user 消息是本次当前消息，必须以它为主要判断对象；群聊历史只是帮助理解语境、指代、参与者关系和话题走向的参考，不要只抓住某一条较早的发言或引用反复回应。参考最近最多 20 条群聊记录（优先最近 3 分钟），结合前后多条消息判断当前消息是否值得回应，以及问题是否已经得到回答。${situation}
+${highValue ? "本地价值评分只表示这段消息值得交给你判断，不代表必须回复；不要为了迎合评分而硬接话。" : "不要为了保持活跃而硬找话题。"}
+${ambiguousCallHint}
+特别注意时效：只回应最近几条消息仍在讨论的内容。若话题在较早消息中已经结束、被回答、被转移到其他话题，绝不能把旧问题重新捡起来；不要因为上下文里还出现过一个问题就突然回答它。若最近消息不足以确认话题仍在继续，优先静默。
+以下情况通常不回复：只是简短附和/刷表情/重复内容；话题已结束；问题已被群友充分回答；上下文不足；插话会打断别人；消息明显是在对其他人说而你没有可补充的内容；近期有人直接 @ 机器人且正在等待它的正常回复。
+若没有自然、有内容的回应必要，只输出这个特殊符号，不能加引号、标点、解释或 Markdown：${AUTO_CHIME_SILENCE_TOKEN}
+若值得回应，直接输出一条简短、自然、贴合上下文的中文消息。不要提到评分、筛选、自动接话或你正在做判断，不要 @ 任何人。不要复述整段聊天，也不要凭空编造事实。若上下文含有图片标记，只有图片确实有助于理解时才调用 get_recent_group_image。`;
 }
 
 async function performGroupConversationChime(
   ws,
-  { groupId, selfId, botName, excludeMessageId = null },
+  { groupId, selfId, botName, force = false, triggerText = "", triggerReasons = [], triggerMessageId = null, triggerHasImage = false, createdAt = Date.now() },
 ) {
   if (groupId === null || groupId === undefined) return;
   if (isNoRandomTalkGroup(groupId)) return;
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
 
   const state = getGroupTalkState(groupId);
+  const clearGeneration = getGroupHistoryGeneration(groupId);
   const now = Date.now();
-  if (state.autoTalkInFlight) return;
-  if (now - state.lastAutoTalkAt < AUTO_TALK_COOLDOWN_MS) return;
-  if (now - state.lastChimeCheckAt < AUTO_CHIME_CHECK_COOLDOWN_MS) return;
+  if (state.autoTalkInFlight) {
+    // 高价值触发不能因为另一轮普通接话正在运行而丢失，结束后补跑一次。
+    if (force) {
+      const previousAt = Number(state.pendingHighValue?.createdAt || 0);
+      if (!previousAt || createdAt >= previousAt) {
+        state.pendingHighValue = { groupId, selfId, botName, force: true, triggerText, triggerReasons, triggerMessageId, triggerHasImage, createdAt };
+      }
+    }
+    return;
+  }
+  // 普通语义判断每群限频。冷却期间不排队旧候选，避免话题结束后又翻出来回复；下一条新消息会重新评估。
+  if (!force && now - state.lastChimeCheckAt < RUNTIME_CONFIG.autoChimeCheckCooldownMs) return;
+  // 自动插话不是直接向机器人提问：冷却期间直接忽略，不把旧候选延迟到话题过期后再回复。
+  if (force && now - state.lastForcedChimeAt < RUNTIME_CONFIG.autoChimeForceCooldownMs) {
+    console.log(`[群聊接话] 高价值候选处于冷却，忽略 group=${groupId}`);
+    return;
+  }
+  if (force) state.lastForcedChimeAt = now;
 
   state.messages = state.messages.filter(
-    (item) => now - item.at <= AUTO_TALK_ACTIVE_WINDOW_MS,
+    (item) => now - item.at <= RUNTIME_CONFIG.autoTalkActiveWindowMs,
   );
   const uniqueUsers = new Set(state.messages.map((item) => item.userId));
   const hasMention = state.messages.some((item) => item.hasMention);
-  if (
-    hasMention ||
-    state.messages.length < AUTO_CHIME_MIN_MESSAGES ||
-    state.messages.length > AUTO_CHIME_MAX_MESSAGES ||
-    uniqueUsers.size < AUTO_TALK_ACTIVE_MIN_USERS
-  ) {
-    return;
-  }
+  // 一般候选消息已在入口清洗过滤；不再要求群里凑够固定消息数。
+  // 最近有人 @ 机器人时仍让正常回复路径优先处理，除非这是显式高价值触发。
+  if (!force && hasMention) return;
 
   state.autoTalkInFlight = true;
   state.lastChimeCheckAt = now;
+  const sessionId = `qq_group_${String(groupId)}_chime_${Date.now()}`;
 
   try {
-    // 排除触发本次检查的最新消息，给模型的只有此前的群聊记录，不传当前群友的消息作为 user 请求。
-    const groupContextPrompt = await fetchGroupHistory(
+    // 把触发消息作为真正的当前 user 消息；历史只承担上下文参考，避免 AI 只围绕某条旧发言作答。
+    const cleanTriggerText = String(triggerText || "").trim();
+    let groupContextPrompt = await fetchGroupHistory(
       groupId,
-      excludeMessageId,
+      triggerHasImage ? null : triggerMessageId,
       selfId,
+      true,
+      { maxAgeMs: RUNTIME_CONFIG.groupAutoHistoryMaxAgeMs, limit: RUNTIME_CONFIG.maxGroupContextMessages },
     );
-    if (!groupContextPrompt || hasRecentGroupMention(groupContextPrompt)) return;
+    if (getGroupHistoryGeneration(groupId) !== clearGeneration) return;
+    if (!String(groupContextPrompt || "").trim()) groupContextPrompt = "[近期群聊历史暂时不可用]";
 
-    const contextPrompt = `${groupContextPrompt}
-【任务：判断是否自然接话】你是在旁观群聊，不是在回答某个当前用户的问题。根据上面的近期聊天记录判断是否存在自然、有内容、能顺着群友思路补充观点的切入点。若话题零散、上下文不足、插话突兀、只能重复别人说过的话，或者你不确定是否适合接话，只输出这一串字符，不加引号、不加解释：${AUTO_CHIME_SILENCE_TOKEN}。如果适合接话，就直接说出自己的观点，像普通群友一样自然，不要提到自动接话或你正在做判断。可以使用多条短消息，不要 @ 任何人。`;
+    const taskPrompt = buildGroupReplyDecisionPrompt({ mode: "conversation", highValue: force, triggerText, triggerReasons });
+    const triggerMeta = force
+      ? `\n【本次触发线索】${(triggerReasons || []).join(", ") || "消息价值判断建议交给 AI 评估"}。这只是唤醒原因，不代表必须回复。`
+      : "";
+    const contextPrompt = `${groupContextPrompt}\n\n【自动接话判断要求】${taskPrompt}${triggerMeta}`;
+    const primaryMessage = cleanTriggerText || "请根据最近群聊判断是否适合自然接话。";
 
-    const sessionId = `qq_group_${String(groupId)}_chime_${Date.now()}`;
     const res = await coreProcessChat(
       sessionId,
-      "[群聊观察任务：判断是否适合自然接话]",
+      primaryMessage,
       undefined,
       {
         isOwner: false,
@@ -411,9 +539,13 @@ async function performGroupConversationChime(
         searchText: null,
         thinkingText: null,
         contextPrompt,
+        contextKey: `group:${String(groupId)}`,
         allowTools: true,
-        toolAllowlist: ["send_multiple_messages"],
-        historyTextEntry: "[群聊观察任务：判断是否适合自然接话]",
+        toolAllowlist: ["send_multiple_messages", "get_recent_group_image", "quote_group_message"],
+        getGroupImage: ({ messageId } = {}) => fetchRecentGroupImage(groupId, messageId),
+        isContextCurrent: () => getGroupHistoryGeneration(groupId) === clearGeneration,
+        requestPriority: "auto",
+        historyTextEntry: "[群聊观察任务]",
       },
     );
 
@@ -421,22 +553,31 @@ async function performGroupConversationChime(
     if (res?.type === "text" && res.content) {
       const text = String(res.content).trim();
       if (isNoChimeResponse(text)) {
-        console.log(`[群聊接话判断] 不接话 group=${groupId}`);
+        console.log(`[群聊接话判断] AI 判断无需回应 group=${groupId} mode=${force ? "high-value" : "normal"}`);
         return;
       }
       if (text) outgoing = [text];
     } else if (res?.type === "multi_text_pending" && Array.isArray(res.messages)) {
       outgoing = res.messages.map((item) => String(item ?? "").trim()).filter(Boolean);
       if (!outgoing.length || outgoing.some(isNoChimeResponse)) {
-        console.log(`[群聊接话判断] 不接话 group=${groupId}`);
+        console.log(`[群聊接话判断] AI 判断无需回应 group=${groupId} mode=${force ? "high-value" : "normal"}`);
         return;
       }
     }
 
-    if (!outgoing.length) return;
+    if (!outgoing.length) {
+      if (res?.type === "skipped") {
+        console.log(`[群聊接话判断] 全局限速，忽略低优先级插话 group=${groupId}`);
+        return;
+      }
+      console.warn(`[群聊接话判断] 模型未返回可发送文本 group=${groupId} mode=${force ? "high-value" : "normal"} type=${res?.type || "empty"}`);
+      return;
+    }
+    if (getGroupHistoryGeneration(groupId) !== clearGeneration) return;
 
     for (let i = 0; i < outgoing.length; i++) {
-      await sendAiTextMessages(ws, groupId, true, outgoing[i]);
+      if (getGroupHistoryGeneration(groupId) !== clearGeneration) return;
+      await sendAiTextMessages(ws, groupId, true, outgoing[i], [], i === 0 ? res.quoteMessageId : null);
       if (i < outgoing.length - 1) {
         await new Promise((resolve) => setTimeout(resolve, 180));
       }
@@ -448,21 +589,125 @@ async function performGroupConversationChime(
     console.error(`[群聊接话判断] 失败 group=${groupId}: ${error.message}`);
   } finally {
     state.autoTalkInFlight = false;
+    clearHistory(sessionId); // 每次只使用 QQ 群历史，避免把静默符号或旧判断留在模型会话里。
+    drainPendingGroupTasks(ws, state);
+  }
+}
+
+async function performImplicitBotFollowup(ws, args) {
+  const {
+    groupId, senderId, messageId, selfId, botName, messageText, senderName,
+    lastBotText, clearGeneration, createdAt = Date.now(),
+  } = args || {};
+  if (groupId === null || groupId === undefined || isNoRandomTalkGroup(groupId) || isBlacklisted(senderId)) return;
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  if (getGroupHistoryGeneration(groupId) !== clearGeneration) return;
+  if (Date.now() - Number(createdAt || Date.now()) > RUNTIME_CONFIG.botFollowupMaxPendingAgeMs) {
+    console.log(`[群聊隐式回复] 候选已过期，忽略 group=${groupId} msg=${messageId ?? "?"}`);
+    return;
+  }
+
+  const state = getGroupTalkState(groupId);
+  if (state.autoTalkInFlight) {
+    const previousAt = Number(state.pendingImplicitReply?.createdAt || 0);
+    if (!previousAt || createdAt >= previousAt) state.pendingImplicitReply = args;
+    console.log(`[群聊隐式回复] 正在处理其他任务，暂存最新消息 group=${groupId} msg=${messageId ?? "?"}`);
+    return;
+  }
+
+  state.autoTalkInFlight = true;
+  const sessionId = `qq_group_${String(groupId)}_implicit_${String(messageId ?? Date.now())}`;
+  try {
+    // 排除当前消息，让它作为真正的最后一条 user 消息；最近机器人发言仅作为线索之一。
+    const groupContextPrompt = await fetchGroupHistory(
+      groupId,
+      messageId,
+      selfId,
+      true,
+      { maxAgeMs: RUNTIME_CONFIG.botFollowupWindowMs, limit: RUNTIME_CONFIG.maxGroupContextMessages },
+    );
+    if (getGroupHistoryGeneration(groupId) !== clearGeneration) return;
+
+    const cleanText = cleanValueText(messageText) || String(messageText || "").trim();
+    const contextPrompt = `【任务：理解当前群友消息】
+最后一条 user 消息才是需要优先处理的当前消息。先判断它本身在说什么，再结合前后多条群聊记录理解指代、话题变化和参与者关系。不要因为机器人刚说过话，就默认当前消息一定是在回复机器人；机器人上一条发言只是参考线索，不能盖过当前消息的实际内容。如果当前消息在回应其他群友或开启新话题，应按当前消息本身处理，不要强行续接机器人的旧话题。
+【机器人最近一条发言，仅供判断上下文】${String(lastBotText || "").slice(0, 800) || "无"}
+【最近群聊记录】
+${groupContextPrompt || "[群聊历史暂时不可用]"}
+若当前消息很可能是在回应、追问机器人，可以自然接话；若明显是群友之间交流、与机器人无关或没有必要回应，返回静默符号 ${AUTO_CHIME_SILENCE_TOKEN}。如果短句只提到 AI、机器人或昵称且无法确定是否在叫你，可以简短确认是否在叫你。若需要回应较早的具体消息，可使用 quote_group_message，但引用只是辅助，不要只围绕引用消息回答。`;
+
+    const res = await coreProcessChat(sessionId, cleanText || String(messageText || ""), undefined, {
+      isOwner: false,
+      isGroup: true,
+      userId: String(senderId),
+      botId: String(selfId),
+      botName,
+      userNickname: senderName || null,
+      searchText: null,
+      thinkingText: null,
+      contextPrompt,
+      contextKey: `group:${String(groupId)}`,
+      allowTools: true,
+      toolAllowlist: ["quote_group_message", "get_recent_group_image"],
+      getGroupImage: ({ messageId: imageMessageId } = {}) => fetchRecentGroupImage(groupId, imageMessageId),
+      isContextCurrent: () => getGroupHistoryGeneration(groupId) === clearGeneration,
+      requestPriority: "followup",
+      historyTextEntry: "[群聊隐式回复判断]",
+    });
+    if (getGroupHistoryGeneration(groupId) !== clearGeneration) return;
+    if (res?.type === "skipped") {
+      console.log(`[群聊隐式回复] API 限速且请求过期，忽略 group=${groupId} msg=${messageId ?? "?"}`);
+      return;
+    }
+
+    let outgoing = [];
+    if (res?.type === "text" && res.content) {
+      const text = String(res.content).trim();
+      if (isNoChimeResponse(text)) {
+        console.log(`[群聊隐式回复] AI 判断不是对机器人的回应 group=${groupId} msg=${messageId ?? "?"}`);
+        return;
+      }
+      if (text) outgoing = [text];
+    } else if (res?.type === "multi_text_pending" && Array.isArray(res.messages)) {
+      outgoing = res.messages.map((item) => String(item ?? "").trim()).filter(Boolean);
+      if (!outgoing.length || outgoing.some(isNoChimeResponse)) return;
+    }
+
+    for (let i = 0; i < outgoing.length; i++) {
+      if (getGroupHistoryGeneration(groupId) !== clearGeneration) return;
+      await sendAiTextMessages(ws, groupId, true, outgoing[i], i === 0 ? (res.mentionQqs || []) : [], i === 0 ? res.quoteMessageId : null);
+      if (i < outgoing.length - 1) await new Promise((resolve) => setTimeout(resolve, 150));
+    }
+    if (outgoing.length) state.lastAutoTalkAt = Date.now();
+  } catch (error) {
+    console.error(`[群聊隐式回复] 失败 group=${groupId}: ${error.message}`);
+  } finally {
+    state.autoTalkInFlight = false;
+    clearHistory(sessionId);
+    drainPendingGroupTasks(ws, state);
   }
 }
 
 function recordGroupTalkActivity(
   ws,
-  { groupId, senderId, messageId, messageTime, selfId, botName, hasMention = false, suppressAutoTalk = false, suppressMediaAutoTalk = false },
+  { groupId, senderId, messageId, messageTime, selfId, botName, hasMention = false, suppressAutoTalk = false, suppressAutoChime = false, aiCandidate = false, blockedByValue = false, valueScore = null, highValue = false, valueReasons = [], messageText = "", hasImageForAutoTalk = false, suppressMediaAutoTalk = false },
 ) {
-  if (groupId === null || groupId === undefined || suppressAutoTalk) return;
+  if (groupId === null || groupId === undefined) return;
   if (isNoRandomTalkGroup(groupId)) return;
   if (isBlacklisted(senderId) || String(senderId) === String(selfId)) return;
 
   const state = getGroupTalkState(groupId);
+  if (blockedByValue) {
+    clearGroupIdleTimer(state);
+    if (!state.activeChimeForce) clearGroupChimeTimer(state);
+    state.lastMessageAt = Date.now();
+    state.lastMessageId = messageId ?? null;
+    return;
+  }
+  if (suppressAutoTalk) return;
   if (suppressMediaAutoTalk) {
     clearGroupIdleTimer(state);
-    clearGroupChimeTimer(state);
+    if (!state.activeChimeForce) clearGroupChimeTimer(state);
     state.lastMessageAt = Date.now();
     state.lastMessageId = messageId ?? null;
     return;
@@ -472,8 +717,8 @@ function recordGroupTalkActivity(
     ? Number(messageTime) * 1000
     : now;
 
-  state.messages.push({ at, userId: String(senderId), messageId, hasMention: Boolean(hasMention) });
-  state.messages = state.messages.filter((item) => now - item.at <= AUTO_TALK_ACTIVE_WINDOW_MS);
+  state.messages.push({ at, userId: String(senderId), messageId, hasMention: Boolean(hasMention), valueScore, highValue: Boolean(highValue), valueReasons, messageText: String(messageText || "") });
+  state.messages = state.messages.filter((item) => now - item.at <= RUNTIME_CONFIG.autoTalkActiveWindowMs);
   state.lastMessageAt = at;
   state.lastMessageId = messageId ?? null;
 
@@ -486,45 +731,59 @@ function recordGroupTalkActivity(
       mode: "idle",
       excludeMessageId: null,
     });
-  }, AUTO_TALK_IDLE_MS);
+  }, RUNTIME_CONFIG.autoTalkIdleMs);
 
-  const uniqueUsers = new Set(state.messages.map((item) => item.userId));
-  const hasMentionInWindow = state.messages.some((item) => item.hasMention);
-  clearGroupChimeTimer(state);
-  if (
-    !hasMention &&
-    !hasMentionInWindow &&
-    state.messages.length >= AUTO_CHIME_MIN_MESSAGES &&
-    state.messages.length <= AUTO_CHIME_MAX_MESSAGES &&
-    uniqueUsers.size >= AUTO_TALK_ACTIVE_MIN_USERS
-  ) {
-    const latestMessageId = state.lastMessageId;
+  const forceHighValueChime = Boolean(highValue) && !hasMention;
+  const normalChimeEligible = Boolean(aiCandidate) || (
+    !hasMention && state.messages.length >= RUNTIME_CONFIG.autoChimeMinMessages &&
+    new Set(state.messages.map((item) => item.userId)).size >= RUNTIME_CONFIG.autoTalkActiveMinUsers
+  );
+
+  if (suppressAutoChime) {
+    // 这条消息会走“是否在回应机器人”的专门判断，避免和群聊旁观判断重复请求。
+    clearGroupChimeTimer(state);
+    return;
+  }
+
+  if (forceHighValueChime) {
+    // 高价值定时器优先级最高；后续普通消息不得把它清掉，只允许更新为更新的高价值消息。
+    clearGroupChimeTimer(state);
+    state.activeChimeForce = true;
     state.activeChimeTimer = setTimeout(() => {
       state.activeChimeTimer = null;
+      state.activeChimeForce = false;
       void performGroupConversationChime(ws, {
         groupId,
         selfId,
         botName,
-        excludeMessageId: latestMessageId,
+        force: true,
+        triggerText: String(messageText || "").trim(),
+        triggerReasons: Array.isArray(valueReasons) ? valueReasons : [],
+        triggerMessageId: messageId ?? null,
+        triggerHasImage: Boolean(hasImageForAutoTalk),
+        createdAt: Date.now(),
       });
-    }, AUTO_CHIME_DEBOUNCE_MS);
+    }, RUNTIME_CONFIG.autoChimeDebounceMs);
+    console.log(`[群聊接话触发] 高价值消息 group=${groupId} score=${Number(valueScore).toFixed(3)}`);
+  } else if (!state.activeChimeForce) {
+    clearGroupChimeTimer(state);
+    if (normalChimeEligible) {
+      state.activeChimeTimer = setTimeout(() => {
+        state.activeChimeTimer = null;
+        void performGroupConversationChime(ws, {
+          groupId,
+          selfId,
+          botName,
+          force: false,
+          triggerText: String(messageText || "").trim(),
+          triggerReasons: Array.isArray(valueReasons) ? valueReasons : [],
+          triggerMessageId: messageId ?? null,
+          createdAt: Date.now(),
+        });
+      }, RUNTIME_CONFIG.autoChimeDebounceMs);
+    }
   }
 
-  if (
-    !hasMention &&
-    !state.messages.some((item) => item.hasMention) &&
-    state.messages.length >= AUTO_TALK_ACTIVE_MIN_MESSAGES &&
-    uniqueUsers.size >= AUTO_TALK_ACTIVE_MIN_USERS &&
-    now - state.lastAutoTalkAt >= AUTO_TALK_COOLDOWN_MS
-  ) {
-    void performGroupAutoTalk(ws, {
-      groupId,
-      selfId,
-      botName,
-      mode: "active",
-      excludeMessageId: messageId ?? null,
-    });
-  }
 }
 
 // ===== HTTP =====
@@ -637,34 +896,55 @@ function sanitizeInput(text) {
   return sanitizeText(text, getBotConfig().sensitiveWords.input);
 }
 
-function containsBotNameCall(text) {
-  const source = String(text ?? "");
-  if (!source) return false;
-
-  const names = [...new Set(["Yuragi", getBotConfig().nickname]
-    .map((name) => String(name ?? "").trim())
-    .filter(Boolean))];
-
-  return names.some((name) => {
-    const pattern = [...name].map(escapeRegExp).join("[\\s._-]*");
-    return new RegExp(`(^|[^a-z0-9_])${pattern}(?=$|[^a-z0-9_])`, "i").test(source);
-  });
-}
-
 function sanitizeOutput(text) {
   return sanitizeText(text, getBotConfig().sensitiveWords.output);
 }
 
 // ===== 控制指令 =====
 
+function getBotClearGeneration(sessionId) {
+  return `${botGlobalClearGeneration}:${botSessionClearGenerations.get(String(sessionId)) || 0}`;
+}
+
+function getGroupHistoryGeneration(groupId) {
+  return `${globalGroupHistoryClearVersion}:${groupHistoryClearVersions.get(String(groupId)) || 0}`;
+}
+
 function clearGroupHistory(groupId, time) {
   if (groupId === null || groupId === undefined) return;
-  groupHistoryClearPoints.set(String(groupId), Number(time) || 0);
+  const key = String(groupId);
+  groupHistoryClearPoints.set(key, Number(time) || 0);
+  groupHistoryClearVersions.set(key, (groupHistoryClearVersions.get(key) || 0) + 1);
+  clearHistory(`qq_group_${key}_auto`);
+  clearContextRequests(`group:${key}`);
+  forwardContextCache.clear();
+  for (const imageKey of recentImageContexts.keys()) {
+    if (imageKey.startsWith(`group:${key}:`)) recentImageContexts.delete(imageKey);
+  }
+  saveGroupHistoryClearState();
+  const state = groupTalkStates.get(key);
+  if (state) {
+    clearGroupIdleTimer(state);
+    clearGroupChimeTimer(state);
+    state.pendingHighValue = null;
+    state.messages = [];
+    state.lastMessageAt = Date.now();
+  }
 }
 
 function clearAllGroupHistory(time) {
   globalGroupHistoryClearTime = Number(time) || 0;
+  globalGroupHistoryClearVersion++;
   groupHistoryClearPoints.clear();
+  groupHistoryClearVersions.clear();
+  saveGroupHistoryClearState();
+  for (const state of groupTalkStates.values()) {
+    clearGroupIdleTimer(state);
+    clearGroupChimeTimer(state);
+    state.pendingHighValue = null;
+    state.messages = [];
+    state.lastMessageAt = Date.now();
+  }
 }
 
 function getGroupHistoryClearTime(groupId) {
@@ -678,14 +958,24 @@ function handleBotControlCommand({ command, sessionId, groupId, isGroup, message
   if (!command) return null;
 
   if (command.action === "clear") {
+    const key = String(sessionId);
+    botSessionClearGenerations.set(key, (botSessionClearGenerations.get(key) || 0) + 1);
     clearHistory(sessionId);
-    if (isGroup) clearGroupHistory(groupId, messageTime);
+    if (isGroup) {
+      clearGroupHistory(groupId, messageTime);
+    } else {
+      recentImageContexts.delete(getRecentImageContextKey(false, null, sessionId.replace(/^qq_/, "")));
+    }
     return "好";
   }
 
   if (command.action === "clear_all") {
+    botGlobalClearGeneration++;
+    botSessionClearGenerations.clear();
     clearAllHistories();
     clearAllGroupHistory(messageTime);
+    recentImageContexts.clear();
+    forwardContextCache.clear();
     return "好";
   }
 
@@ -752,7 +1042,34 @@ async function sendQqMsg(
 
 // ===== AI 消息拆分 / 特殊内容统一路由 =====
 
-async function sendAiTextMessages(ws, targetId, isGroup, text, mentionQqs = []) {
+async function sendNativeQuotedGroupMessage(ws, groupId, text, mentionQqs, replyMessageId) {
+  const cleanText = sanitizeOutput(String(text ?? ""));
+  const id = String(replyMessageId ?? "").trim();
+  if (!cleanText || !/^\d{1,30}$/.test(id)) return false;
+  const message = [{ type: "reply", data: { id } }];
+  for (const value of Array.isArray(mentionQqs) ? mentionQqs : []) {
+    const qq = String(value ?? "").trim();
+    if (qq === "all" || /^\d{5,12}$/.test(qq)) message.push({ type: "at", data: { qq } });
+  }
+  message.push({ type: "text", data: { text: cleanText } });
+  const params = { group_id: groupId, message };
+  if (NAPCAT_HTTP_URL && NAPCAT_TOKEN) {
+    const result = await callNapCatHttp("send_group_msg", params);
+    if (result) return true;
+  }
+  if (!ws || ws.readyState !== WebSocket.OPEN) throw new Error("NapCat WebSocket 当前未连接");
+  ws.send(JSON.stringify({ action: "send_group_msg", params }));
+  return true;
+}
+
+function canUseNativeQuote(text) {
+  const value = String(text ?? "");
+  return value.length <= 1200 &&
+    !/```|\\\(|\\\[|\\begin\{|===SPLIT===|^\s*(?:#{1,6}\s|\|.*\|\s*$)/mu.test(value) &&
+    !/\n\s*\n/u.test(value);
+}
+
+async function sendAiTextMessages(ws, targetId, isGroup, text, mentionQqs = [], replyMessageId = null) {
   const message = sanitizeOutput(String(text ?? ""));
   if (!message) return;
 
@@ -762,8 +1079,13 @@ async function sendAiTextMessages(ws, targetId, isGroup, text, mentionQqs = []) 
         .filter((value) => value === "all" || /^\d{5,12}$/.test(value)))]
     : [];
 
-  // 特殊内容模块负责按 ===SPLIT=== 拆分，并将首个真实 @ 与正文放进同一条消息。
-  await sendSpecialContent(targetId, isGroup, message, mentions);
+  // 原生 QQ 引用只用于普通短文本；代码、LaTeX、拆分消息仍交给特殊内容渲染器。
+  if (isGroup && replyMessageId && canUseNativeQuote(message)) {
+    await sendNativeQuotedGroupMessage(ws, targetId, message, mentions, replyMessageId);
+  } else {
+    await sendSpecialContent(targetId, isGroup, message, mentions);
+  }
+  if (isGroup) noteBotGroupReply(targetId, message);
 }
 
 
@@ -802,6 +1124,28 @@ async function sendQqMention(ws, groupId, userId) {
 }
 
 // ===== NapCat HTTP =====
+
+async function setPrivateTypingStatus(userId, isTyping) {
+  if (!NAPCAT_HTTP_URL || !NAPCAT_TOKEN || userId === null || userId === undefined) return false;
+  const url = NAPCAT_HTTP_URL.replace(/\/+$/, "") + "/set_input_status";
+  try {
+    const response = await httpClient.post(
+      url,
+      { user_id: String(userId), event_type: isTyping ? 1 : 0 },
+      {
+        headers: {
+          Authorization: `Bearer ${NAPCAT_TOKEN}`,
+          "Content-Type": "application/json",
+        },
+        timeout: 1500,
+      },
+    );
+    return response?.data?.retcode === undefined || Number(response.data.retcode) === 0;
+  } catch {
+    // 旧版或不支持此扩展的 NapCat 静默降级，不影响消息发送。
+    return false;
+  }
+}
 
 async function callNapCatHttp(action, params) {
   if (!NAPCAT_HTTP_URL || !NAPCAT_TOKEN) return null;
@@ -1346,14 +1690,14 @@ async function extractImageFromMessage(message) {
 
 // ===== 获取群聊历史 =====
 
-async function fetchGroupHistory(groupId, currentMessageId = null, selfId = null) {
+async function fetchGroupHistory(groupId, currentMessageId = null, selfId = null, includeImageToolHints = false, options = {}) {
   if (!NAPCAT_HTTP_URL || !NAPCAT_TOKEN) return "";
   const url = NAPCAT_HTTP_URL.replace(/\/+$/, "") + "/get_group_msg_history";
 
   try {
     const response = await httpClient.post(
       url,
-      { group_id: groupId, count: 15, message_seq: 0 },
+      { group_id: groupId, count: RUNTIME_CONFIG.maxGroupHistoryFetchCount, message_seq: 0 },
       {
         headers: {
           Authorization: `Bearer ${NAPCAT_TOKEN}`,
@@ -1377,8 +1721,16 @@ async function fetchGroupHistory(groupId, currentMessageId = null, selfId = null
 
     const clearTime = getGroupHistoryClearTime(groupId);
     const formattedMsgs = [];
+    const maxAgeMs = Number(options?.maxAgeMs) > 0 ? Number(options.maxAgeMs) : 0;
+    const oldestAllowedTime = maxAgeMs > 0 ? Date.now() / 1000 - maxAgeMs / 1000 : 0;
+    const timestampOf = (message) => {
+      const value = Number(message?.time || 0);
+      return value > 1e12 ? value / 1000 : value; // 兼容秒与毫秒时间戳。
+    };
+    // NapCat 的历史返回顺序不应被假定；统一按时间升序，避免 slice(-N) 取错“最近”消息。
+    const orderedMessages = [...msgs].sort((a, b) => timestampOf(a) - timestampOf(b));
 
-    for (const m of msgs) {
+    for (const m of orderedMessages) {
       if (!m || typeof m !== "object") continue;
 
       if (
@@ -1389,9 +1741,13 @@ async function fetchGroupHistory(groupId, currentMessageId = null, selfId = null
         continue;
       }
 
-      if (clearTime > 0 && Number(m.time || 0) <= clearTime) continue;
+      const messageTimestamp = timestampOf(m);
+      if (clearTime > 0 && messageTimestamp <= clearTime) continue;
+      // 自动接话只使用能确认时间且足够新的消息；缺失时间戳时不让未知旧消息混入上下文。
+      if (oldestAllowedTime > 0 && (!messageTimestamp || messageTimestamp < oldestAllowedTime)) continue;
       if (isBlacklisted(m.user_id)) continue;
-      if (Array.isArray(m.message) && m.message.some((seg) => ["image", "video", "record"].includes(seg?.type))) continue;
+      if (Array.isArray(m.message) && m.message.some((seg) => ["video", "record"].includes(seg?.type))) continue;
+      const hasImage = Array.isArray(m.message) && m.message.some((seg) => seg?.type === "image");
 
       const sender = m.sender && typeof m.sender === "object" ? m.sender : {};
       const senderId = String(m.user_id ?? "未知");
@@ -1408,20 +1764,97 @@ async function fetchGroupHistory(groupId, currentMessageId = null, selfId = null
 
       cleanRaw = annotateStructuredMessageText(cleanRaw);
       const isStructured = /【结构化消息类型：/.test(cleanRaw);
-      cleanRaw = cleanRaw.slice(0, isStructured ? 500 : 100);
+      cleanRaw = cleanRaw.slice(0, isStructured ? 500 : 150);
+      const imageHint = hasImage && includeImageToolHints
+        ? ` [含图片；可按需调用 get_recent_group_image，message_id=${String(m.message_id)}]`
+        : hasImage
+          ? " [含图片]"
+          : "";
       formattedMsgs.push(
         isSelf
-          ? `你（机器人） [QQ:${senderId}]: ${cleanRaw}`
-          : `群友「${sName}」 [QQ:${senderId}]: ${cleanRaw}`,
+          ? `[消息ID:${String(m.message_id)}] 你（机器人） [QQ:${senderId}]: ${cleanRaw}${imageHint}`
+          : `[消息ID:${String(m.message_id)}] 群友「${sName}」 [QQ:${senderId}]: ${cleanRaw}${imageHint}`,
       );
     }
 
     if (!formattedMsgs.length) return "";
-    const finalMsgs = formattedMsgs.slice(-15);
-    return "\n[群聊历史，仅供上下文参考]\n" + finalMsgs.join("\n") + "\n";
+    const historyLimit = Number.isInteger(Number(options?.limit)) && Number(options.limit) > 0
+      ? Math.min(100, Number(options.limit))
+      : RUNTIME_CONFIG.maxGroupContextMessages;
+    const finalMsgs = formattedMsgs.slice(-historyLimit);
+    const ageHint = maxAgeMs > 0 ? `，仅最近 ${Math.round(maxAgeMs / 60000)} 分钟` : "";
+    const header = `[最近群聊历史，仅供上下文参考；最多 ${historyLimit} 条${ageHint}，按时间顺序排列]`;
+    const maxChars = Math.max(500, Number(RUNTIME_CONFIG.maxGroupContextChars) || 6000);
+    const selected = [];
+    let usedChars = Array.from(header).length + 2;
+    // 从最新消息向前纳入上下文，达到字数上限后停止；最终仍按时间升序提交。
+    for (let i = finalMsgs.length - 1; i >= 0; i--) {
+      const line = finalMsgs[i];
+      const length = Array.from(line).length + 1;
+      if (usedChars + length > maxChars && selected.length) break;
+      selected.unshift(line);
+      usedChars += length;
+      if (usedChars >= maxChars) break;
+    }
+    const contextText = `\n${header}\n${selected.join("\n")}\n`;
+    if (finalMsgs.length > selected.length) console.log(`[QQ历史] 上下文已裁剪 ${finalMsgs.length}->${selected.length} 条，约 ${usedChars} 字`);
+    return contextText;
   } catch (error) {
     console.error(`[QQ历史] 获取群历史异常: ${error.message}`);
     return "";
+  }
+}
+
+// 自动接话只有在模型主动调用工具时才下载图片；只访问近期、未被清除的群消息。
+async function fetchRecentGroupImage(groupId, requestedMessageId = null) {
+  if (!NAPCAT_HTTP_URL || !NAPCAT_TOKEN || groupId === null || groupId === undefined) return null;
+  const url = NAPCAT_HTTP_URL.replace(/\/+$/, "") + "/get_group_msg_history";
+  try {
+    const response = await httpClient.post(
+      url,
+      { group_id: groupId, count: RUNTIME_CONFIG.maxGroupHistoryFetchCount, message_seq: 0 },
+      {
+        headers: {
+          Authorization: `Bearer ${NAPCAT_TOKEN}`,
+          "Content-Type": "application/json",
+        },
+        timeout: 4000,
+      },
+    );
+    const result = response?.data;
+    if (response.status !== 200 || (result?.status !== undefined && result.status !== "ok") || (result?.retcode ?? 0) !== 0) return null;
+    const data = result.data;
+    const messages = data && typeof data === "object" && !Array.isArray(data)
+      ? data.messages || []
+      : Array.isArray(data) ? data : [];
+    const clearTime = getGroupHistoryClearTime(groupId);
+    const candidates = messages
+      .filter((item) => {
+        if (!item || typeof item !== "object") return false;
+        if (clearTime > 0 && Number(item.time || 0) <= clearTime) return false;
+        if (isBlacklisted(item.user_id)) return false;
+        if (item.group_id !== undefined && String(item.group_id) !== String(groupId)) return false;
+        if (!Array.isArray(item.message) || !item.message.some((seg) => seg?.type === "image")) return false;
+        return requestedMessageId === null || requestedMessageId === undefined || String(item.message_id) === String(requestedMessageId);
+      })
+      .sort((a, b) => Number(b.time || 0) - Number(a.time || 0));
+    const message = candidates[0];
+    if (!message) return null;
+    const imageContent = await extractImageFromMessage(message);
+    if (!imageContent) return null;
+    const sender = message.sender && typeof message.sender === "object" ? message.sender : {};
+    const text = (await messageSegmentsToTextAsync(message.message || []))
+      .replace(/\[图片\]/g, "")
+      .trim();
+    return {
+      imageContent,
+      messageId: String(message.message_id ?? ""),
+      senderName: String(sender.card || sender.nickname || message.user_id || "群友"),
+      text: text.slice(0, 500),
+    };
+  } catch (error) {
+    console.warn(`[群聊图片工具] 读取近期图片失败：${error.message}`);
+    return null;
   }
 }
 
@@ -1563,6 +1996,67 @@ async function handleQqWs() {
 // ===== QQ 事件分发 =====
 
 async function handleQqEvent(ws, event) {
+  const isPrivateMessage = event?.post_type === "message" && event?.message_type === "private";
+  const userId = event?.user_id;
+  if (!isPrivateMessage || isBlacklisted(userId) || String(userId) === String(event?.self_id)) {
+    return handleQqEventInternal(ws, event);
+  }
+
+  const key = String(userId);
+  let state = privateTypingStates.get(key);
+  if (!state) {
+    state = {
+      activeRequests: 0,
+      timer: null,
+      typingShown: false,
+      statusPromise: Promise.resolve(false),
+    };
+    privateTypingStates.set(key, state);
+  }
+  state.activeRequests++;
+  let leaseReleased = false;
+
+  const releaseTypingLease = async () => {
+    if (leaseReleased) return;
+    leaseReleased = true;
+    state.activeRequests = Math.max(0, state.activeRequests - 1);
+
+    if (state.activeRequests !== 0) return;
+    if (state.timer) clearTimeout(state.timer);
+    state.timer = null;
+    const shouldStop = state.typingShown;
+    state.typingShown = false;
+    if (privateTypingStates.get(key) === state) privateTypingStates.delete(key);
+
+    if (shouldStop) {
+      // 确保“结束输入”排在“开始输入”之后；不会在最终消息发出后继续显示输入状态。
+      try { await state.statusPromise; } catch {}
+      await setPrivateTypingStatus(userId, false);
+    }
+  };
+
+  // 只在收到消息满 1 秒仍未完成时显示输入状态；短请求不会闪一下。
+  if (state.activeRequests === 1) {
+    state.timer = setTimeout(() => {
+      state.timer = null;
+      if (state.activeRequests <= 0 || privateTypingStates.get(key) !== state) return;
+      state.typingShown = true;
+      state.statusPromise = setPrivateTypingStatus(userId, true);
+    }, 1000);
+  }
+
+  try {
+    return await handleQqEventInternal(ws, event, { onCoreComplete: releaseTypingLease });
+  } finally {
+    // 若请求在调用模型前就结束，也要释放；若已在 SSE 完成时释放则此处是空操作。
+    await releaseTypingLease();
+  }
+}
+
+async function handleQqEventInternal(ws, event, lifecycle = {}) {
+  const onCoreComplete = typeof lifecycle?.onCoreComplete === "function"
+    ? lifecycle.onCoreComplete
+    : null;
   const postType = event?.post_type;
   const botName = getBotConfig().nickname;
 
@@ -1628,6 +2122,8 @@ async function handleQqEvent(ws, event) {
   const isGroup = messageType === "group";
   const targetId = isGroup ? groupId : senderId;
   const sessionId = isGroup ? `qq_${groupId}_${senderId}` : `qq_${senderId}`;
+  const responseClearGeneration = getBotClearGeneration(sessionId);
+  const groupContextGeneration = isGroup ? getGroupHistoryGeneration(groupId) : null;
   resetPokeStreak(senderId, isGroup ? groupId : null);
 
   if (isBlacklisted(senderId)) return;
@@ -1650,6 +2146,7 @@ async function handleQqEvent(ws, event) {
   let replyMessageFetched = false;
   let isReplyToBot = false;
   let hasUnsupportedContent = false;
+  let blockedByValueScore = false;
 
   const segments = Array.isArray(event.message) ? event.message : [];
 
@@ -1743,13 +2240,8 @@ async function handleQqEvent(ws, event) {
 
   if (isAtAll) return;
 
-  // 名字触发在输入清洗前后都检查，避免清洗规则删掉称呼后漏判。
-  const calledByNameBeforeSanitize = isGroup && containsBotNameCall(userText);
+  // 清洗后，昵称由独立价值评分模块加分；仅真实 QQ @ 才走直接回复通道。
   userText = sanitizeInput(userText);
-  if (isGroup && (calledByNameBeforeSanitize || containsBotNameCall(userText))) {
-    isMentioned = true;
-    hasAnyMention = true;
-  }
 
   // 先读取引用目标，群聊中引用了机器人的发言即使没有 @ 也应触发回复。
   if (replyMessageId) {
@@ -1825,11 +2317,69 @@ async function handleQqEvent(ws, event) {
       botName,
       searchText: null,
     });
+    if (onCoreComplete) await onCoreComplete();
 
     if (res?.type === "text")
       await sendAiTextMessages(ws, targetId, isGroup, res.content, res.mentionQqs);
     return;
   }
+
+  // 广义候选判断：有意义的句子交给现有 API 结合上下文判断，不再要求本地样例命中。
+  const hasImageForAutoTalk = hasImageSegment;
+  const hasUnsupportedAutoMedia = segments.some((seg) => ["video", "record"].includes(seg?.type));
+  const recentBotReplyAtMessage = isGroup && !hasAnyMention && !isReplyToBot ? getRecentBotGroupReply(groupId) : null;
+  const textFilter = shouldEvaluateMessage(userText);
+  const implicitFollowupCandidate = Boolean(
+    recentBotReplyAtMessage && !hasImageForAutoTalk && !hasUnsupportedAutoMedia && textFilter.eligible
+  );
+  let aiCandidateAssessment = null;
+  let messageValueAssessment = null;
+  if (isGroup && !hasAnyMention && !isReplyToBot && !hasUnsupportedAutoMedia) {
+    const scoreText = cleanValueText(userText);
+    if (implicitFollowupCandidate) {
+      const ruleResult = evaluateMessageValue(scoreText, botName);
+      messageValueAssessment = combineMessageValue(ruleResult, null);
+      messageValueAssessment.highValue = true;
+      messageValueAssessment.combinedScore = Math.max(0.5, messageValueAssessment.combinedScore);
+      messageValueAssessment.reasons = [...new Set([...(messageValueAssessment.reasons || []), "recent-bot-reply"] )];
+      console.log(`[群消息价值] group=${groupId} bypass=recent-bot-reply auto=ai-followup text=${JSON.stringify(scoreText.slice(0, 80))}`);
+    } else if (hasImageForAutoTalk) {
+      // 图片不送入文本嵌入；直接唤醒 AI 判断，只有需要看图时才调用图片工具.
+      messageValueAssessment = {
+        text: scoreText,
+        eligible: true,
+        filterReason: null,
+        ruleScore: 1,
+        reasons: ["image-bypass"],
+        isBotNameCall: false,
+        combinedScore: 1,
+        highValue: true,
+        bypass: true,
+      };
+      console.log(`[群消息价值] group=${groupId} mode=${RUNTIME_CONFIG.valueScoreMode} bypass=image auto=yes`);
+    } else if (RUNTIME_CONFIG.valueScoreMode !== "off" && scoreText) {
+      const ruleResult = evaluateMessageValue(scoreText, botName);
+      if (!ruleResult.eligible) {
+        messageValueAssessment = combineMessageValue(ruleResult, null);
+        blockedByValueScore = RUNTIME_CONFIG.valueScoreMode === "block";
+        console.log(`[群消息价值] group=${groupId} filter=${ruleResult.filterReason || "low-signal"} auto=no text=${JSON.stringify(scoreText.slice(0, 80))}`);
+      } else {
+        const valueResult = await scoreMessage(scoreText, RUNTIME_CONFIG.valueScoreMode);
+        messageValueAssessment = combineMessageValue(ruleResult, valueResult);
+        const confidentVector = !valueResult.lowConfidence && Number.isFinite(valueResult.topSimilarity) && Number.isFinite(valueResult.score);
+        blockedByValueScore = RUNTIME_CONFIG.valueScoreMode === "block" && Boolean(valueResult.blocked) && confidentVector && messageValueAssessment.combinedScore < RUNTIME_CONFIG.autoChimeScoreThreshold;
+        const vectorText = Number.isFinite(valueResult.score) ? valueResult.score.toFixed(3) : "—";
+        const combinedText = Number.isFinite(messageValueAssessment.combinedScore) ? messageValueAssessment.combinedScore.toFixed(3) : "—";
+        const ruleText = Number.isFinite(messageValueAssessment.ruleScore) ? messageValueAssessment.ruleScore.toFixed(3) : "—";
+        const topValue = Number.isFinite(valueResult.topSimilarity) ? valueResult.topSimilarity.toFixed(3) : "—";
+        console.log(`[群消息价值] group=${groupId} mode=${RUNTIME_CONFIG.valueScoreMode} vector=${vectorText} rule=${ruleText} combined=${combinedText} top=${topValue} reasons=${messageValueAssessment.reasons.join(",") || "none"} auto=${messageValueAssessment.highValue ? "yes" : "no"} ${blockedByValueScore ? "blocked" : "allowed"}`);
+      }
+    }
+  }
+  aiCandidateAssessment = shouldAskAiAboutMessage(userText, {
+    recentBotReply: Boolean(recentBotReplyAtMessage),
+    vectorHighValue: Boolean(messageValueAssessment?.highValue),
+  });
 
   // ----- 群聊自动接话 / 直接回复判断 -----
   if (isGroup) {
@@ -1842,9 +2392,33 @@ async function handleQqEvent(ws, event) {
       botName,
       hasMention: hasAnyMention,
       suppressAutoTalk: isReplyToBot,
-      suppressMediaAutoTalk: segments.some((seg) => ["image", "video", "record"].includes(seg?.type)),
+      blockedByValue: blockedByValueScore,
+      valueScore: messageValueAssessment?.combinedScore ?? null,
+      highValue: Boolean(messageValueAssessment?.highValue) && !blockedByValueScore,
+      valueReasons: messageValueAssessment?.reasons || evaluateMessageValue(userText, botName).reasons,
+      messageText: userText || (hasImageForAutoTalk ? "[群友发送了一张图片]" : userText),
+      hasImageForAutoTalk,
+      suppressAutoChime: implicitFollowupCandidate,
+      aiCandidate: aiCandidateAssessment.candidate && !hasAnyMention && !isReplyToBot,
+      suppressMediaAutoTalk: hasUnsupportedAutoMedia,
     });
 
+    if (implicitFollowupCandidate) {
+      const followupArgs = {
+        groupId,
+        senderId: String(senderId),
+        messageId,
+        selfId: String(selfId),
+        botName,
+        messageText: userText,
+        senderName: String(event.sender?.card || event.sender?.nickname || senderId),
+        lastBotText: recentBotReplyAtMessage?.text || "",
+        clearGeneration: groupContextGeneration,
+        createdAt: Date.now(),
+      };
+      void performImplicitBotFollowup(ws, followupArgs);
+      return;
+    }
     if (!isMentioned && !isReplyToBot) return;
   }
 
@@ -1967,6 +2541,7 @@ async function handleQqEvent(ws, event) {
         botName,
         searchText: null,
       });
+      if (onCoreComplete) await onCoreComplete();
 
       if (res?.type === "text")
         await sendAiTextMessages(ws, targetId, isGroup, res.content, res.mentionQqs);
@@ -2027,10 +2602,12 @@ async function handleQqEvent(ws, event) {
       imageSourceUrl,
       contextPrompt,
       historyTextEntry: cleanUserHistoryEntry,
+      contextKey: isGroup ? `group:${String(groupId)}` : null,
+      isContextCurrent: () => !isGroup || getGroupHistoryGeneration(groupId) === groupContextGeneration,
 
       onThinkingStart: async () => {
       console.log(`[QQ] 开始思考 session=${sessionId}`);
-      await sendQqMsg(ws, targetId, isGroup, "让我想想…");
+      if (isGroup) await sendQqMsg(ws, targetId, true, "让我想想…");
     },
 
     onImageReady: async (image) => {
@@ -2082,8 +2659,16 @@ async function handleQqEvent(ws, event) {
       return await sendQqPoke(ws, userId, groupId);
     },
   });
+    if (onCoreComplete) await onCoreComplete();
   } finally {
     endUserApiRequest(senderId);
+  }
+
+  if (
+    getBotClearGeneration(sessionId) !== responseClearGeneration ||
+    (isGroup && getGroupHistoryGeneration(groupId) !== groupContextGeneration)
+  ) {
+    res = { type: "cleared", content: "" };
   }
 
   // ----- 输出处理 -----
@@ -2105,6 +2690,7 @@ async function handleQqEvent(ws, event) {
           isGroup,
           message,
           i === 0 ? mentions : [],
+          i === 0 ? res.quoteMessageId : null,
         );
       } catch (error) {
         console.error(`[QQ] 多条消息发送失败 index=${i + 1}/${messages.length}: ${error.message}`);
@@ -2121,6 +2707,7 @@ async function handleQqEvent(ws, event) {
       isGroup,
       res.content || "",
       Array.isArray(res.mentionQqs) ? res.mentionQqs : [],
+      res.quoteMessageId,
     );
   }
 }
@@ -2171,6 +2758,7 @@ export {
   extractImageFromMessage,
   extractImageSourceFromMessage,
   fetchGroupHistory,
+  fetchRecentGroupImage,
   isOwnerQQ,
   isBlacklisted,
   isNoRandomTalkGroup,

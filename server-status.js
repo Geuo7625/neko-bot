@@ -315,7 +315,7 @@ async function getServerStatus() {
 
   // 详细查看
   lines.push("");
-  lines.push("详细查看  run.geuo.org/state ↗");
+  lines.push("详细查看  run.geuo.org ↗");
 
   return lines.join("\n");
 }
