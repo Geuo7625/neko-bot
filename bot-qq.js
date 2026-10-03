@@ -4,9 +4,14 @@ import WebSocket from "ws";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
-import { NAPCAT_WS_URL, NAPCAT_HTTP_URL, NAPCAT_TOKEN, RUNTIME_CONFIG } from "./config.js";
+import { NAPCAT_WS_URL, NAPCAT_HTTP_URL, NAPCAT_TOKEN, RUNTIME_CONFIG, onRuntimeConfigReload } from "./config.js";
 import { coreProcessChat, clearHistory, clearAllHistories, clearContextRequests, AUTO_SKIP_MARKER } from "./core.js";
 import { embedText } from "./memory.js";
+import {
+  clearGroupTopicMemory,
+  retrieveGroupTopicSummaries,
+  storeGroupTopicSummary,
+} from "./group-topic-memory.js";
 import { sendSpecialContent } from "./special-content.js";
 import { handleControlCommand } from "./control.js";
 import { getServerStatus, checkServerStatusRateLimit } from "./server-status.js";
@@ -271,6 +276,10 @@ function getGroupTalkState(groupId) {
       speechVersion: 0,
       messageVectors: [],
       recentSpeech: [],
+      topicMemoryPending: [],
+      topicMemoryStartedAt: 0,
+      topicMemoryTimer: null,
+      topicMemoryInFlight: false,
       willingness: 0,
       lastWillingnessAt: Date.now(),
     };
@@ -387,8 +396,139 @@ function scoreTopicContinuity(vector, history) {
   return Math.max(0, Math.min(1, dot / (vectorNorm * meanNorm)));
 }
 
+function scheduleGroupTopicMemoryFlush(groupId, state, delayMs) {
+  if (state.topicMemoryTimer) clearTimeout(state.topicMemoryTimer);
+  state.topicMemoryTimer = setTimeout(() => {
+    state.topicMemoryTimer = null;
+    void flushGroupTopicMemory(groupId);
+  }, Math.max(0, delayMs));
+  state.topicMemoryTimer.unref?.();
+}
+
+onRuntimeConfigReload(() => {
+  const now = Date.now();
+  for (const [groupId, state] of groupTalkStates) {
+    if (state.topicMemoryTimer) clearTimeout(state.topicMemoryTimer);
+    state.topicMemoryTimer = null;
+    if (!RUNTIME_CONFIG.topicMemoryEnabled) {
+      state.topicMemoryPending = [];
+      state.topicMemoryStartedAt = 0;
+      continue;
+    }
+    if (state.topicMemoryPending.length && !state.topicMemoryInFlight) {
+      const maxInterval = Math.max(60000, Number(RUNTIME_CONFIG.topicMemoryMaxIntervalMs) || 7200000);
+      const elapsed = state.topicMemoryStartedAt ? now - state.topicMemoryStartedAt : 0;
+      scheduleGroupTopicMemoryFlush(groupId, state, Math.max(0, maxInterval - elapsed));
+    }
+  }
+});
+
+function queueGroupTopicMemoryMessage(groupId, senderName, text) {
+  if (!RUNTIME_CONFIG.topicMemoryEnabled) return;
+  const content = cleanValueText(text);
+  if (!content) return;
+  const state = getGroupTalkState(groupId);
+  if (!state.topicMemoryPending.length) state.topicMemoryStartedAt = Date.now();
+  state.topicMemoryPending.push(`${String(senderName || "群友").slice(0, 40)}：${content}`);
+
+  const batchCount = Math.max(5, Number(RUNTIME_CONFIG.topicMemoryBatchMessageCount) || 50);
+  if (state.topicMemoryPending.length >= batchCount && !state.topicMemoryInFlight) {
+    if (state.topicMemoryTimer) clearTimeout(state.topicMemoryTimer);
+    state.topicMemoryTimer = null;
+    void flushGroupTopicMemory(groupId);
+  } else if (!state.topicMemoryTimer && !state.topicMemoryInFlight) {
+    scheduleGroupTopicMemoryFlush(
+      groupId,
+      state,
+      Math.max(60000, Number(RUNTIME_CONFIG.topicMemoryMaxIntervalMs) || 7200000),
+    );
+  }
+}
+
+async function flushGroupTopicMemory(groupId) {
+  const state = getGroupTalkState(groupId);
+  if (!RUNTIME_CONFIG.topicMemoryEnabled) {
+    state.topicMemoryPending = [];
+    state.topicMemoryStartedAt = 0;
+    return;
+  }
+  if (state.topicMemoryInFlight || !state.topicMemoryPending.length) return;
+  state.topicMemoryInFlight = true;
+  const batchCount = Math.max(5, Number(RUNTIME_CONFIG.topicMemoryBatchMessageCount) || 50);
+  const batch = state.topicMemoryPending.splice(0, batchCount);
+  state.topicMemoryStartedAt = state.topicMemoryPending.length ? Date.now() : 0;
+  const sessionId = `qq_group_${String(groupId)}_topic_summary`;
+  const generation = getGroupHistoryGeneration(groupId);
+
+  try {
+    const result = await coreProcessChat(
+      sessionId,
+      `请把下面这批群聊压缩成100到200字的滚动摘要。口语化、只记事实，不评价、不猜测；写清谁在聊什么、已有结论和群内梗。不要复述辱骂或不当内容。\n\n${batch.join("\n")}`,
+      undefined,
+      {
+        isOwner: false,
+        isGroup: true,
+        userId: null,
+        botId: null,
+        botName: getBotConfig().nickname,
+        searchText: null,
+        allowTools: false,
+        contextKey: `group:${String(groupId)}`,
+        requestPriority: "auto",
+        historyTextEntry: "群聊滚动摘要",
+        isContextCurrent: () => getGroupHistoryGeneration(groupId) === generation,
+      },
+    );
+    if (!RUNTIME_CONFIG.topicMemoryEnabled) return;
+    if (getGroupHistoryGeneration(groupId) !== generation) return;
+    if (result?.type !== "text") {
+      console.warn(`[群聊记忆] 摘要生成未完成 group=${groupId} type=${result?.type || "unknown"}`);
+      return;
+    }
+    const summary = Array.from(cleanValueText(result.content)).slice(0, 200).join("");
+    if (Array.from(summary).length < 100) {
+      console.warn(`[群聊记忆] 摘要过短，跳过 group=${groupId}`);
+      return;
+    }
+    const embedding = await embedText(summary);
+    if (!RUNTIME_CONFIG.topicMemoryEnabled) return;
+    if (!storeGroupTopicSummary(groupId, summary, embedding)) {
+      console.warn(`[群聊记忆] 摘要未入库 group=${groupId}`);
+    }
+  } catch (error) {
+    console.warn(`[群聊记忆] 摘要写入失败 group=${groupId}: ${error.message}`);
+  } finally {
+    clearHistory(sessionId);
+    state.topicMemoryInFlight = false;
+    if (state.topicMemoryPending.length) {
+      const nextBatchCount = Math.max(5, Number(RUNTIME_CONFIG.topicMemoryBatchMessageCount) || 50);
+      if (state.topicMemoryPending.length >= nextBatchCount) {
+        void flushGroupTopicMemory(groupId);
+      } else {
+        scheduleGroupTopicMemoryFlush(
+          groupId,
+          state,
+          Math.max(60000, Number(RUNTIME_CONFIG.topicMemoryMaxIntervalMs) || 7200000),
+        );
+      }
+    }
+  }
+}
+
+function getGroupTopicMemoryPrompt(groupId, vector) {
+  if (!RUNTIME_CONFIG.topicMemoryEnabled || !vector?.length) return "";
+  try {
+    const summaries = retrieveGroupTopicSummaries(groupId, vector, RUNTIME_CONFIG.topicMemoryTopK);
+    if (!summaries.length) return "";
+    return `以下是本群近期的聊天摘要，仅供参考，不要复述：\n${summaries.map((item) => `- ${item.summary}`).join("\n")}`;
+  } catch (error) {
+    console.warn(`[群聊记忆] 读取失败 group=${groupId}: ${error.message}`);
+    return "";
+  }
+}
+
 async function generateAutoReply(ws, {
-  groupId, selfId, botName, senderId, messageId, text, score, valueResult, clearGeneration,
+  groupId, selfId, botName, senderId, messageId, text, score, valueResult, messageVector, clearGeneration,
 }) {
   const state = getGroupTalkState(groupId);
   const speechVersion = state.speechVersion;
@@ -397,7 +537,8 @@ async function generateAutoReply(ws, {
     const groupContext = await fetchGroupHistory(groupId, messageId, selfId, false);
     if (getGroupHistoryGeneration(groupId) !== clearGeneration) return;
     if (state.speechVersion !== speechVersion) return;
-    const contextPrompt = `${groupContext}\n你是群里的普通聊天成员。专业或技术问题、需要严谨知识的问题、与当前话题无关的内容，或回复可能答错、添乱、打断交流时，只输出${AUTO_SKIP_MARKER}。轻松玩笑和日常闲聊可以自然接梗；其他情况下结合当前消息口语化回复，最多40字，不要@任何人。`;
+    const memoryPrompt = getGroupTopicMemoryPrompt(groupId, messageVector);
+    const contextPrompt = `${groupContext}\n${memoryPrompt}\n你是群里的普通聊天成员。专业或技术问题、需要严谨知识的问题、与当前话题无关的内容，或回复可能答错、添乱、打断交流时，只输出${AUTO_SKIP_MARKER}。轻松玩笑和日常闲聊可以自然接梗；其他情况下结合当前消息口语化回复，最多40字，不要@任何人。`;
     const result = await coreProcessChat(
       `qq_group_${String(groupId)}_auto`,
       text,
@@ -575,12 +716,16 @@ function clearGroupHistory(groupId, time) {
   saveGroupHistoryClearState();
   const state = groupTalkStates.get(key);
   if (state) {
+    if (state.topicMemoryTimer) clearTimeout(state.topicMemoryTimer);
     state.messages = [];
     state.messageVectors = [];
     state.recentSpeech = [];
+    state.topicMemoryPending = [];
+    state.topicMemoryStartedAt = 0;
     state.willingness = 0;
     state.lastWillingnessAt = Date.now();
   }
+  clearGroupTopicMemory(key);
 }
 
 function clearAllGroupHistory(time) {
@@ -590,12 +735,16 @@ function clearAllGroupHistory(time) {
   groupHistoryClearVersions.clear();
   saveGroupHistoryClearState();
   for (const state of groupTalkStates.values()) {
+    if (state.topicMemoryTimer) clearTimeout(state.topicMemoryTimer);
     state.messages = [];
     state.messageVectors = [];
     state.recentSpeech = [];
+    state.topicMemoryPending = [];
+    state.topicMemoryStartedAt = 0;
     state.willingness = 0;
     state.lastWillingnessAt = Date.now();
   }
+  clearGroupTopicMemory();
 }
 
 function getGroupHistoryClearTime(groupId) {
@@ -1694,6 +1843,16 @@ async function handleQqEventInternal(ws, event) {
     return;
   }
 
+  // 摘要采集独立于仲裁，异步入缓冲，不等待 LLM/SQLite 写入。
+  if (isGroup && userText.trim()) {
+    const senderName = event.sender?.card || event.sender?.nickname || String(senderId);
+    try {
+      queueGroupTopicMemoryMessage(groupId, senderName, userText);
+    } catch (error) {
+      console.warn(`[群聊记忆] 收集失败 group=${groupId}: ${error.message}`);
+    }
+  }
+
   // direct 优先；其他群消息先收集硬否决与上下文信号，再交给唯一 decide()。
   const hasInlineMedia = segments.some((seg) => ["image", "video", "record"].includes(seg?.type));
   const direct = !isGroup || isMentioned || isReplyToBot;
@@ -1777,6 +1936,7 @@ async function handleQqEventInternal(ws, event) {
       text: scoreText,
       score: Number(decisionContext.score || 0),
       valueResult,
+      messageVector: vector,
       clearGeneration: groupContextGeneration,
     });
     return;
@@ -1880,10 +2040,12 @@ async function handleQqEventInternal(ws, event) {
   const groupContextPrompt = isGroup
     ? await fetchGroupHistory(groupId, messageId, selfId)
     : "";
+  const topicMemoryPrompt = isGroup ? getGroupTopicMemoryPrompt(groupId, vector) : "";
 
   // ----- 构造 AI 上下文 -----
   const contextParts = [];
   if (groupContextPrompt) contextParts.push(groupContextPrompt);
+  if (topicMemoryPrompt) contextParts.push(topicMemoryPrompt);
   if (quotedMessageContext) contextParts.push(quotedMessageContext);
   if (recentImageContext && !replyMessageId) {
     contextParts.push("[最近图片：仅在与当前消息相关时使用，否则忽略。]");

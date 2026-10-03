@@ -84,6 +84,15 @@ export const RUNTIME_CONFIG = {
   autoPresenceMaxRatio: 0.60,
   autoPresenceMaxPenalty: 0.25,
 
+  // 群聊滚动摘要记忆。
+  topicMemoryEnabled: true,
+  topicMemoryTopK: 3,
+  topicMemoryRetentionDays: 7,
+  topicMemoryMaxPerGroup: 50,
+  topicMemoryBatchMessageCount: 50,
+  topicMemoryMaxIntervalMs: 7200000,
+  topicMemoryCleanupIntervalMs: 3600000,
+
   // 每群意愿状态机参数。
   willingnessMax: 3,
   willingnessDecayIntervalMs: 15000,
@@ -159,6 +168,12 @@ const NUMERIC_RANGES = {
   autoPresenceSoftRatio: [0, 1],
   autoPresenceMaxRatio: [0, 1],
   autoPresenceMaxPenalty: [0, 1],
+  topicMemoryTopK: [1, 10],
+  topicMemoryRetentionDays: [1, 90],
+  topicMemoryMaxPerGroup: [1, 200],
+  topicMemoryBatchMessageCount: [5, 500],
+  topicMemoryMaxIntervalMs: [60000, 86400000],
+  topicMemoryCleanupIntervalMs: [60000, 86400000],
   willingnessMax: [0, 20],
   willingnessDecayIntervalMs: [1000, 300000],
   willingnessDecayFactor: [0, 1],
@@ -180,6 +195,9 @@ const NUMERIC_RANGES = {
 function normalizeRuntimeConfig(candidate) {
   const next = { ...RUNTIME_CONFIG };
   if (!candidate || typeof candidate !== "object") return next;
+  if (typeof candidate.topicMemoryEnabled === "boolean") {
+    next.topicMemoryEnabled = candidate.topicMemoryEnabled;
+  }
   for (const [key, range] of Object.entries(NUMERIC_RANGES)) {
     if (!(key in candidate)) continue;
     const value = Number(candidate[key]);
