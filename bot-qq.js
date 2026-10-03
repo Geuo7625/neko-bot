@@ -17,6 +17,7 @@ import {
   decide,
   isHardVetoMessage,
   isTechnicalQuestion,
+  scoreContent,
   shouldEvaluateMessage,
 } from "./message-value.js";
 
@@ -269,6 +270,7 @@ function getGroupTalkState(groupId) {
       autoReplyInFlight: false,
       speechVersion: 0,
       messageVectors: [],
+      recentSpeech: [],
       willingness: 0,
       lastWillingnessAt: Date.now(),
     };
@@ -279,6 +281,16 @@ function getGroupTalkState(groupId) {
 
 function recordAutoTalk(state, at = Date.now()) {
   state.autoTalkTimes.push(at);
+}
+
+function isGroupCoolingDown(state, now = Date.now()) {
+  const cooldownMs = Math.max(0, Number(RUNTIME_CONFIG.autoTalkCooldownMs) || 180000);
+  const hourlyWindowMs = Math.max(60000, Number(RUNTIME_CONFIG.autoTalkHourlyWindowMs) || 3600000);
+  const hourlyLimit = Math.max(1, Number(RUNTIME_CONFIG.autoTalkHourlyLimit) || 3);
+  state.autoTalkTimes = state.autoTalkTimes.filter((at) => now - at < hourlyWindowMs);
+  return state.autoReplyInFlight ||
+    now - state.lastAutoTalkAt < cooldownMs ||
+    state.autoTalkTimes.length >= hourlyLimit;
 }
 
 function decayWillingness(state, now = Date.now()) {
@@ -322,6 +334,9 @@ function noteGroupBotSpeech(groupId) {
   state.willingness = Math.max(0, state.willingness - (Number(RUNTIME_CONFIG.willingnessReplyPenalty) || 2));
   state.lastAutoTalkAt = now;
   state.speechVersion++;
+  state.recentSpeech.push({ at: now, isBot: true });
+  const presenceWindowMs = Math.max(10000, Number(RUNTIME_CONFIG.autoPresenceWindowMs) || 300000);
+  state.recentSpeech = state.recentSpeech.filter((entry) => now - entry.at <= presenceWindowMs);
 }
 
 function isPureStickerMessage(segments, text) {
@@ -345,6 +360,9 @@ function isRepeatedSpam(state, senderId, text, now = Date.now()) {
 }
 
 function rememberGroupMessage(state, senderId, text, vector = null, now = Date.now()) {
+  state.recentSpeech.push({ at: now, isBot: false });
+  const presenceWindowMs = Math.max(10000, Number(RUNTIME_CONFIG.autoPresenceWindowMs) || 300000);
+  state.recentSpeech = state.recentSpeech.filter((entry) => now - entry.at <= presenceWindowMs);
   const normalized = cleanValueText(text).toLocaleLowerCase();
   if (!normalized) return;
   state.messages.push({ at: now, userId: String(senderId), text: normalized });
@@ -370,7 +388,7 @@ function scoreTopicContinuity(vector, history) {
 }
 
 async function generateAutoReply(ws, {
-  groupId, selfId, botName, senderId, messageId, text, score, vector, clearGeneration,
+  groupId, selfId, botName, senderId, messageId, text, score, valueResult, clearGeneration,
 }) {
   const state = getGroupTalkState(groupId);
   const speechVersion = state.speechVersion;
@@ -404,7 +422,8 @@ async function generateAutoReply(ws, {
     if (getGroupHistoryGeneration(groupId) !== clearGeneration) return;
     if (state.speechVersion !== speechVersion) return;
     if (result?.type === "skipped") {
-      console.log(`[群聊自动] skip group=${groupId} score=${score.toFixed(3)}`);
+      const triggerText = Array.from(String(text ?? "")).slice(0, 60).join("");
+      console.log(`[群聊自动] skip group=${groupId} score=${score.toFixed(3)} text=${JSON.stringify(triggerText)}`);
       return;
     }
     if (result?.type !== "text" || !String(result.content ?? "").trim()) return;
@@ -414,7 +433,8 @@ async function generateAutoReply(ws, {
     if (!reply || reply.includes(AUTO_SKIP_MARKER)) return;
     await sendAiTextMessages(ws, groupId, true, reply, [], { trackGroupSpeech: true });
     recordAutoTalk(state, Date.now());
-    console.log(`[群聊自动] sent group=${groupId} vector=${Number.isFinite(vector?.score) ? vector.score.toFixed(3) : "—"} willingness=${state.willingness.toFixed(3)} score=${score.toFixed(3)}`);
+    const triggerText = Array.from(String(text ?? "")).slice(0, 60).join("");
+    console.log(`[群聊自动] sent group=${groupId} vector=${Number.isFinite(valueResult?.score) ? valueResult.score.toFixed(3) : "—"} willingness=${state.willingness.toFixed(3)} score=${score.toFixed(3)} text=${JSON.stringify(triggerText)}`);
   } catch (error) {
     console.error(`[群聊自动] 失败 group=${groupId}: ${error.message}`);
   } finally {
@@ -557,6 +577,7 @@ function clearGroupHistory(groupId, time) {
   if (state) {
     state.messages = [];
     state.messageVectors = [];
+    state.recentSpeech = [];
     state.willingness = 0;
     state.lastWillingnessAt = Date.now();
   }
@@ -571,6 +592,7 @@ function clearAllGroupHistory(time) {
   for (const state of groupTalkStates.values()) {
     state.messages = [];
     state.messageVectors = [];
+    state.recentSpeech = [];
     state.willingness = 0;
     state.lastWillingnessAt = Date.now();
   }
@@ -1695,15 +1717,7 @@ async function handleQqEventInternal(ws, event) {
   let topicContinuity = 0;
   let valueResult = null;
   const now = Date.now();
-  const cooldownMs = Math.max(0, Number(RUNTIME_CONFIG.autoTalkCooldownMs) || 180000);
-  const hourlyWindowMs = Math.max(60000, Number(RUNTIME_CONFIG.autoTalkHourlyWindowMs) || 3600000);
-  const hourlyLimit = Math.max(1, Number(RUNTIME_CONFIG.autoTalkHourlyLimit) || 3);
-  if (groupState) groupState.autoTalkTimes = groupState.autoTalkTimes.filter((at) => now - at < hourlyWindowMs);
-  const coolingDown = Boolean(groupState && !direct && (
-    groupState.autoReplyInFlight ||
-    now - groupState.lastAutoTalkAt < cooldownMs ||
-    groupState.autoTalkTimes.length >= hourlyLimit
-  ));
+  const coolingDown = Boolean(groupState && !direct && isGroupCoolingDown(groupState, now));
 
   if (isGroup && !hardVeto && !filteredMessage && scoreText) {
     try {
@@ -1721,19 +1735,16 @@ async function handleQqEventInternal(ws, event) {
     hardVeto: hardVeto || Boolean(valueResult?.blocked),
     coolingDown,
     valueScore: Number.isFinite(valueResult?.score) ? valueResult.score : 0,
+    valueAbstain: Boolean(valueResult?.lowConfidence),
     topicContinuity,
+    contentScore: direct ? undefined : scoreContent(scoreText, { direct: false, botName }),
     willingness: groupState
       ? groupState.willingness / Math.max(1, Number(RUNTIME_CONFIG.willingnessMax) || 3)
       : 0,
+    recentSpeech: groupState?.recentSpeech,
     claimAuto: groupState
       ? () => {
-          const claimTime = Date.now();
-          groupState.autoTalkTimes = groupState.autoTalkTimes.filter((at) => claimTime - at < hourlyWindowMs);
-          if (
-            groupState.autoReplyInFlight ||
-            claimTime - groupState.lastAutoTalkAt < cooldownMs ||
-            groupState.autoTalkTimes.length >= hourlyLimit
-          ) return false;
+          if (isGroupCoolingDown(groupState)) return false;
           groupState.autoReplyInFlight = true;
           return true;
         }
@@ -1752,7 +1763,7 @@ async function handleQqEventInternal(ws, event) {
               : isNoRandomTalkGroup(groupId) ? "group-disabled"
                 : filteredMessage ? "filtered"
                   : valueResult?.blocked ? "knn-block" : "pass";
-    console.log(`[群消息价值] group=${groupId} mode=${RUNTIME_CONFIG.valueScoreMode} vector=${vectorValue} rule=${ruleValue} top=${topValue} willingness=${decisionContext.willingness.toFixed(3)} topic=${topicContinuity.toFixed(3)} score=${Number(decisionContext.score || 0).toFixed(3)} decision=${decision}`);
+    console.log(`[群消息价值] group=${groupId} mode=${RUNTIME_CONFIG.valueScoreMode} vector=${vectorValue} content=${Number(decisionContext.contentScore || 0).toFixed(3)} rule=${ruleValue} top=${topValue} willingness=${decisionContext.willingness.toFixed(3)} topic=${topicContinuity.toFixed(3)} presence=${Number(decisionContext.presencePenalty || 0).toFixed(3)} score=${Number(decisionContext.score || 0).toFixed(3)} decision=${decision}`);
   }
 
   if (decision === "ignore") return;
@@ -1765,7 +1776,7 @@ async function handleQqEventInternal(ws, event) {
       messageId,
       text: scoreText,
       score: Number(decisionContext.score || 0),
-      vector: valueResult,
+      valueResult,
       clearGeneration: groupContextGeneration,
     });
     return;

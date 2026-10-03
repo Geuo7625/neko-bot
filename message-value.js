@@ -75,23 +75,67 @@ export function shouldEvaluateMessage(input) {
   return { eligible: true, reason: null, text };
 }
 
+export function scoreContent(input, { direct = false, botName = "" } = {}) {
+  const text = cleanValueText(input);
+  const chars = Array.from(text).length;
+  let score = 0;
+
+  // 常见疑问词直接表明有问题；“什么”排除无实际提问的固定口语。
+  const hasQuestionWord = /怎么|如何|为什么|有没有/u.test(text) ||
+    (/什么/u.test(text) && !/(?:没什么|这什么|那什么)/u.test(text));
+  const endsWithQuestionParticle = chars >= 4 && chars <= 80 && /(?:吗|呢)[？?!！。…~～]*$/u.test(text);
+  const hasQuestionMark = chars >= 4 && chars <= 120 && /[？?]/u.test(text);
+  if (hasQuestionWord || endsWithQuestionParticle || hasQuestionMark) score += 0.15;
+
+  const explicitHelp = /帮我|帮忙|请问|可以吗|要不要/u.test(text) ||
+    (direct ? /能不能/u.test(text) : /^能不能/u.test(text));
+  const contextualHelp = direct && /需要|求|看看|试试/u.test(text);
+  if (explicitHelp || contextualHelp) score += 0.20;
+
+  const asksOpinion = /你觉得|你认为|咋看|有什么建议|你怎么看|怎么看你/u.test(text);
+  const mentionsBotName = String(botName ?? "").trim() &&
+    text.toLocaleLowerCase().includes(String(botName).trim().toLocaleLowerCase());
+  if (asksOpinion && (direct || mentionsBotName)) score += 0.20;
+
+  if (LOW_SIGNAL_PATTERN.test(text)) score -= 0.25;
+  return Math.max(0, Math.min(1, Number(score.toFixed(4))));
+}
+
 export function decide(message, context = {}) {
   // 明确呼叫优先，直达原有生成/媒体流程且不受自动冷却影响。
   if (context.direct) return "direct";
   // 硬否决和冷却只拦截自动接话；不进入灰度评分或云端调用。
   if (context.hardVeto || context.coolingDown || !shouldEvaluateMessage(message).eligible) return "ignore";
 
-  const value = clampScore(context.valueScore);
-  const topic = clampScore(context.topicContinuity);
-  const willingness = clampScore(context.willingness);
-  const valueWeight = Math.max(0, Number(RUNTIME_CONFIG.autoValueScoreWeight) || 0);
-  const topicWeight = Math.max(0, Number(RUNTIME_CONFIG.autoTopicContinuityWeight) || 0);
-  const willingnessWeight = Math.max(0, Number(RUNTIME_CONFIG.autoWillingnessWeight) || 0);
-  const weightTotal = valueWeight + topicWeight + willingnessWeight;
-  const score = weightTotal > 0
-    ? (value * valueWeight + topic * topicWeight + willingness * willingnessWeight) / weightTotal
+  const signals = [];
+  const addSignal = (value, weight, abstain = false) => {
+    if (abstain || value === null || value === undefined || !Number.isFinite(Number(value))) return;
+    signals.push({ value: clampScore(value), weight: Math.max(0, Number(weight) || 0) });
+  };
+  addSignal(context.valueScore, RUNTIME_CONFIG.autoValueScoreWeight, context.valueAbstain === true);
+  addSignal(context.topicContinuity, RUNTIME_CONFIG.autoTopicContinuityWeight);
+  addSignal(context.willingness, RUNTIME_CONFIG.autoWillingnessWeight);
+  addSignal(context.contentScore, RUNTIME_CONFIG.autoContentScoreWeight);
+  const weightTotal = signals.reduce((total, signal) => total + Math.max(0, signal.weight), 0);
+  const weightedScore = weightTotal > 0
+    ? signals.reduce((total, signal) => total + signal.value * Math.max(0, signal.weight), 0) / weightTotal
     : 0;
+  const speech = Array.isArray(context.recentSpeech) ? context.recentSpeech : [];
+  const botRatio = speech.length
+    ? speech.filter((entry) => entry?.isBot === true).length / speech.length
+    : 0;
+  const configuredSoftRatio = Number(RUNTIME_CONFIG.autoPresenceSoftRatio);
+  const configuredMaxRatio = Number(RUNTIME_CONFIG.autoPresenceMaxRatio);
+  const configuredMaxPenalty = Number(RUNTIME_CONFIG.autoPresenceMaxPenalty);
+  const softRatio = Number.isFinite(configuredSoftRatio) ? configuredSoftRatio : 0.25;
+  const maxRatio = Number.isFinite(configuredMaxRatio) ? configuredMaxRatio : 0.6;
+  const maxPenalty = Number.isFinite(configuredMaxPenalty) ? configuredMaxPenalty : 0.25;
+  const presencePenalty = botRatio <= softRatio || maxRatio <= softRatio
+    ? 0
+    : Math.min(maxPenalty, Math.max(0, (botRatio - softRatio) / (maxRatio - softRatio)) * maxPenalty);
+  const score = Math.max(0, Math.min(1, weightedScore - presencePenalty));
   context.score = score;
+  context.presencePenalty = presencePenalty;
   // 过阈值后原子占位，防止并发消息重复启动 auto 生成。
   if (score < Number(RUNTIME_CONFIG.autoDecisionThreshold)) return "ignore";
   if (typeof context.claimAuto === "function" && !context.claimAuto()) return "ignore";
