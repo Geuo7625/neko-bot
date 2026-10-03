@@ -4,4 +4,6 @@ bot-config.json
 latex-wasm/
 memory_db/
 assets/
+.cache/
 .gitignore
+.dockerignore

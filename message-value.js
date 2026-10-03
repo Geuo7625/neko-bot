@@ -1,22 +1,22 @@
 import { RUNTIME_CONFIG } from "./config.js";
 
-// 群消息清洗、筛选、规则加分与向量分融合。
+// 群消息清洗与自动仲裁硬过滤；正向意愿只在 decide() 中融合。
 // 不依赖 QQ/NapCat；供 bot-qq.js 与 value-score.js 共用。
 
 const CQ_CODE_PATTERN = /\[CQ:[^\]]*\]/giu;
 const TEXT_MENTION_PATTERN = /@(?:全体成员|全体|[1-9]\d{4,11})(?!\d)/gu;
 const URL_PATTERN = /(?:https?:\/\/|www\.)[^\s<>]+/giu;
 const CONTROL_PATTERN = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/gu;
-const QUESTION_PATTERN = /[?？]/u;
-const QUESTION_END_PATTERN = /(?:吗|呢)[?？!！。…~～]*$/u;
-const QUESTION_START_PATTERN = /^(?:怎么|为什么|为何|如何|什么|为啥|多少|能不能|可不可以|是不是|有没有|哪(?:个|些|里|种|位|家)?|谁|何时|几时|咋|咋办)/u;
-const HELP_PATTERN = /帮我|帮忙|请问|请教|麻烦(?:你|帮我)?|翻译(?:一下|下)?|总结(?:一下|下)?|概括一下|写一个|写一份|生成一个|推荐(?:一下|几个|一些)?|怎么办|怎么做|教我|解释一下|查一下|分析一下|修一下|看看(?:这个|这段|下)?|能否帮|可否帮|求助/u;
-const BOT_TERM_PATTERN = /机器人|人工智能|智能助手|助手|小猫|猫娘|(?:^|[^a-z0-9_])ai(?:$|[^a-z0-9_])|(?:^|[^a-z0-9_])bot(?:$|[^a-z0-9_])|(?:^|[^a-z0-9_])llm(?:$|[^a-z0-9_])/iu;
+// 仅用于识别需硬否决的专业求助，不参与普通消息的加分。
+const TECHNICAL_REQUEST_PATTERN = /[?？]|(?:怎么|为什么|为何|如何|什么|为啥|多少|能不能|可不可以|是不是|有没有|咋办|怎么办|求助|请教|帮我)/u;
+export const TECH_KEYWORDS = /代码|编程|报错|bug|error|异常|堆栈|stack\s*trace|traceback|部署|服务器|api|接口|数据库|git|python|docker|算法|模型|显存|编译|配置|依赖|程序|脚本|终端|linux|windows|容器|网络|端口|日志|崩溃|安装|运行|npm|node(?:\.js)?|javascript|typescript|java|rust|golang|sql|框架|前端|后端|命令|包管理/iu;
+// 明显辱骂只作为硬否决，不用于打分。
+const PROFANITY_PATTERN = /(?:操你|草泥马|傻[逼屄]|他妈|妈的|fuck|shit|bitch)/iu;
+// 明显导流和促销信息只作为硬否决，不用于打分。
+const ADVERTISEMENT_PATTERN = /(?:加群|扫码|推广|广告|返利|优惠券|加微信|微信号|vx号|代购|接单)/iu;
+// 低信号/重复刷屏及占位媒体不进入自动仲裁，也供冻结的 KNN 过滤入口复用。
 const LOW_SIGNAL_PATTERN = /^(?:嗯+|呃+|额+|哦+|噢+|啊+|唉+|诶+|好+|好的|行|可以|收到|懂了|知道了|ok+|kk+|yep|yeah|哈哈+|呵呵+|嘻嘻+|嘿嘿+|笑死|草+|绝了|牛+|6+|666+|？+|\?+|。+|！+|!+|…+|\.{2,})[。！!？?…~～]*$/iu;
 const PLACEHOLDER_PATTERN = /^\[(?:图片|含图片|视频消息|语音消息|文件消息|QQ表情|QQ商城表情|收到特殊QQ消息|收到一条QQ特殊消息)[^\]]*\]$/u;
-const BOT_NAME_WEIGHT = 0.82;
-const SHORT_BOT_TOPIC_BONUS = 0.30;
-const SHORT_BOT_TOPIC_MAX_CHARS = 36;
 const MAX_TEXT_CHARS = 600;
 
 export function cleanValueText(input) {
@@ -37,47 +37,32 @@ export function cleanValueText(input) {
   return text;
 }
 
-function normalizeName(input) {
-  return cleanValueText(input)
-    .toLocaleLowerCase()
-    .replace(/[\p{P}\p{S}\s_]+/gu, "");
+export function isTechnicalQuestion(input) {
+  const text = cleanValueText(input);
+  if (!TECH_KEYWORDS.test(text)) return false;
+  return TECHNICAL_REQUEST_PATTERN.test(text);
 }
 
-function levenshteinAtMostOne(a, b) {
-  if (a === b) return true;
-  if (Math.abs(a.length - b.length) > 1) return false;
-  let i = 0;
-  let j = 0;
-  let edits = 0;
-  while (i < a.length && j < b.length) {
-    if (a[i] === b[j]) { i++; j++; continue; }
-    if (++edits > 1) return false;
-    if (a.length > b.length) i++;
-    else if (b.length > a.length) j++;
-    else { i++; j++; }
-  }
-  if (i < a.length || j < b.length) edits++;
-  return edits <= 1;
-}
-
-function hasBotName(text, botName) {
-  const normalizedText = normalizeName(text);
-  const names = [...new Set(["Yuragi", "ゆらぎ", botName].map(normalizeName).filter((name) => name.length >= 2))];
-  if (names.some((name) => normalizedText.includes(name))) return true;
-
-  // 拉丁字母昵称允许一个字符的轻微拼写差异（如 Yuragii / Yuragi）。
-  const words = cleanValueText(text).toLocaleLowerCase().match(/[a-z][a-z0-9]{3,}/gu) || [];
-  const latinNames = names.filter((name) => /^[a-z][a-z0-9]{4,}$/u.test(name));
-  return words.some((word) => latinNames.some((name) => levenshteinAtMostOne(word, name)));
+export function isHardVetoMessage(input, { sensitiveWords = [] } = {}) {
+  const text = cleanValueText(input);
+  if (isTechnicalQuestion(text) || PROFANITY_PATTERN.test(text) || ADVERTISEMENT_PATTERN.test(text)) return true;
+  const normalized = text.toLocaleLowerCase().replace(/\s+/gu, "");
+  return sensitiveWords.some((word) => {
+    const term = String(word ?? "").toLocaleLowerCase().replace(/\s+/gu, "");
+    return term && normalized.includes(term);
+  });
 }
 
 export function shouldEvaluateMessage(input) {
   const text = cleanValueText(input);
   if (!text) return { eligible: false, reason: "empty", text };
+  // 占位媒体和非文本消息由 direct/media 路由处理，不进入自动文本接话。
   if (PLACEHOLDER_PATTERN.test(text)) return { eligible: false, reason: "media-placeholder", text };
+  // 单独的链接没有足够上下文供主动回复。
   if (/^(?:\[链接\]|链接|https?:\/\/\S+|www\.\S+)$/iu.test(text)) {
     return { eligible: false, reason: "link-only", text };
   }
+  // 纯符号、命令、低信号短语和重复字符属于硬过滤，不是评分加分项。
   if (/^[\p{P}\p{S}\s]+$/u.test(text)) return { eligible: false, reason: "symbols-only", text };
   if (/^(?:\/[\w\p{L}-]+|！?\/[^\s]{1,40})$/u.test(text)) {
     return { eligible: false, reason: "command", text };
@@ -90,104 +75,30 @@ export function shouldEvaluateMessage(input) {
   return { eligible: true, reason: null, text };
 }
 
-export function evaluateMessageValue(input, botName = "") {
-  const text = cleanValueText(input);
-  const filter = shouldEvaluateMessage(text);
-  const reasons = [];
-  let ruleScore = 0;
+export function decide(message, context = {}) {
+  // 明确呼叫优先，直达原有生成/媒体流程且不受自动冷却影响。
+  if (context.direct) return "direct";
+  // 硬否决和冷却只拦截自动接话；不进入灰度评分或云端调用。
+  if (context.hardVeto || context.coolingDown || !shouldEvaluateMessage(message).eligible) return "ignore";
 
-  const isQuestion = QUESTION_PATTERN.test(text) || QUESTION_END_PATTERN.test(text) || QUESTION_START_PATTERN.test(text);
-  if (isQuestion) {
-    ruleScore += 0.25;
-    reasons.push("question");
-  }
-
-  const isHelpRequest = HELP_PATTERN.test(text);
-  if (isHelpRequest) {
-    ruleScore += 0.52;
-    reasons.push("help");
-  }
-
-  const mentionsBotTopic = BOT_TERM_PATTERN.test(text);
-  if (mentionsBotTopic) {
-    ruleScore += 0.32;
-    reasons.push("bot-topic");
-    // 简短的 AI / bot / 机器人相关消息也交给 AI 判断是否是在叫它。
-    if (Array.from(text).length <= SHORT_BOT_TOPIC_MAX_CHARS) {
-      ruleScore += SHORT_BOT_TOPIC_BONUS;
-      reasons.push("short-bot-topic");
-    }
-  }
-
-  const isBotNameCall = hasBotName(text, botName);
-  if (isBotNameCall) {
-    ruleScore += BOT_NAME_WEIGHT;
-    reasons.push("bot-name");
-  }
-
-  ruleScore = Math.min(1, Number(ruleScore.toFixed(4)));
-  return {
-    text,
-    eligible: filter.eligible,
-    filterReason: filter.reason,
-    ruleScore,
-    reasons,
-    isQuestion,
-    isHelpRequest,
-    mentionsBotTopic,
-    isBotNameCall,
-  };
+  const value = clampScore(context.valueScore);
+  const topic = clampScore(context.topicContinuity);
+  const willingness = clampScore(context.willingness);
+  const valueWeight = Math.max(0, Number(RUNTIME_CONFIG.autoValueScoreWeight) || 0);
+  const topicWeight = Math.max(0, Number(RUNTIME_CONFIG.autoTopicContinuityWeight) || 0);
+  const willingnessWeight = Math.max(0, Number(RUNTIME_CONFIG.autoWillingnessWeight) || 0);
+  const weightTotal = valueWeight + topicWeight + willingnessWeight;
+  const score = weightTotal > 0
+    ? (value * valueWeight + topic * topicWeight + willingness * willingnessWeight) / weightTotal
+    : 0;
+  context.score = score;
+  // 过阈值后原子占位，防止并发消息重复启动 auto 生成。
+  if (score < Number(RUNTIME_CONFIG.autoDecisionThreshold)) return "ignore";
+  if (typeof context.claimAuto === "function" && !context.claimAuto()) return "ignore";
+  return "auto";
 }
 
-export function combineMessageValue(ruleResult, vectorResult = null) {
-  const ruleScore = Math.max(0, Math.min(1, Number(ruleResult?.ruleScore) || 0));
-  const vectorScore = Number(vectorResult?.score);
-  const topSimilarity = Number(vectorResult?.topSimilarity);
-  const vectorConfident =
-    vectorResult?.lowConfidence !== true &&
-    Number.isFinite(vectorScore) &&
-    Number.isFinite(topSimilarity) &&
-    topSimilarity >= 0.5;
-
-  // 样例匹配可信时，沿用 KNN 投票分并叠加规则信号；低置信度时只看规则分。
-  const combinedScore = ruleResult?.eligible === false
-    ? 0
-    : vectorConfident
-      // 明确求助/点名等规则信号不能被低 KNN 投票压没；规则分同时提供有限加成。
-      ? Math.min(1, Math.max(0, vectorScore, ruleScore) + Math.min(0.2, ruleScore * 0.2))
-      : ruleScore;
-  const normalizedScore = Number(combinedScore.toFixed(4));
-
-  return {
-    ...ruleResult,
-    vectorScore: Number.isFinite(vectorScore) ? vectorScore : null,
-    topSimilarity: Number.isFinite(topSimilarity) ? topSimilarity : null,
-    vectorConfident,
-    combinedScore: normalizedScore,
-    highValue: ruleResult?.eligible !== false && normalizedScore >= (Number.isFinite(Number(RUNTIME_CONFIG.autoChimeScoreThreshold)) ? Number(RUNTIME_CONFIG.autoChimeScoreThreshold) : 0.5),
-  };
-}
-
-/**
- * Decide whether a cleaned message deserves a contextual LLM check.
- * This is intentionally broad: local rules filter obvious noise, while the LLM
- * decides semantic relevance. API traffic is bounded by the per-group cooldown
- * and debounce in bot-qq.js.
- */
-export function shouldAskAiAboutMessage(input, { recentBotReply = false, vectorHighValue = false } = {}) {
-  const filtered = shouldEvaluateMessage(input);
-  if (!filtered.eligible) return { candidate: false, reason: filtered.reason, text: filtered.text };
-  const text = filtered.text;
-  const chars = Array.from(text).length;
-  if (recentBotReply) return { candidate: true, reason: "recent-bot-reply", text };
-  if (vectorHighValue) return { candidate: true, reason: "vector-or-rule-high-value", text };
-  // Any meaningful sentence can be evaluated; there is no need to enumerate every
-  // possible question wording. Very short messages only pass if the existing rules
-  // found a question/request/bot reference.
-  const hasExplicitSignal = /[?？]/u.test(text) || QUESTION_END_PATTERN.test(text) ||
-    QUESTION_START_PATTERN.test(text) || HELP_PATTERN.test(text) || BOT_TERM_PATTERN.test(text);
-  if (chars >= 3 || hasExplicitSignal) {
-    return { candidate: true, reason: hasExplicitSignal ? "explicit-signal" : "substantive-text", text };
-  }
-  return { candidate: false, reason: "too-short-for-llm-check", text };
+function clampScore(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? Math.max(0, Math.min(1, number)) : 0;
 }

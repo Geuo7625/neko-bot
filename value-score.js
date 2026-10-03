@@ -196,7 +196,7 @@ export async function scoreMessage(message, mode = RUNTIME_CONFIG.valueScoreMode
       }
       score = totalWeight > 0 ? weightedVote / totalWeight : 0;
       // y=1 表示高价值；只有可信度足够且投票低于阈值，才应拦截。
-      wouldBlock = score < (Number.isFinite(Number(RUNTIME_CONFIG.autoChimeScoreThreshold)) ? Number(RUNTIME_CONFIG.autoChimeScoreThreshold) : 0.5);
+      wouldBlock = score < (Number.isFinite(Number(RUNTIME_CONFIG.autoChimeScoreThreshold)) ? Number(RUNTIME_CONFIG.autoChimeScoreThreshold) : 0.8);
     }
 
 

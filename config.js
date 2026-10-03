@@ -10,8 +10,8 @@ export const NAPCAT_TOKEN = process.env.NAPCAT_TOKEN || "nekoneko";
 // ============================================================
 // 服务地址
 // ============================================================
-const NAPCAT_HOST = process.env.NAPCAT_HOST || "192.168.1.20";
-const SEARXNG_HOST = process.env.SEARXNG_HOST || "192.168.1.20";
+const NAPCAT_HOST = process.env.NAPCAT_HOST;
+const SEARXNG_HOST = process.env.SEARXNG_HOST;
 export const AI_URL =
   process.env.AI_URL || "https://apihub.agnes-ai.com/v1/chat/completions";
 export const AI_IMAGE_URL =
@@ -73,23 +73,34 @@ export const RUNTIME_CONFIG = {
   maxGroupContextMessages: 20,
   maxGroupContextChars: 6000,
 
-  // 自动接话与上下文时效。分数阈值只决定是否交给 AI 判断，不代表 AI 必须回复。
+  // 唯一自动仲裁的融合权重和阈值。
+  autoDecisionThreshold: 0.62,
+  autoValueScoreWeight: 0.65,
+  autoTopicContinuityWeight: 0.20,
+  autoWillingnessWeight: 0.15,
+
+  // 每群意愿状态机参数。
+  willingnessMax: 3,
+  willingnessDecayIntervalMs: 15000,
+  willingnessDecayFactor: 0.9,
+  willingnessMessageGain: 0.1,
+  willingnessMentionGain: 0.9,
+  willingnessStickerMultiplier: 0.35,
+  willingnessReplyPenalty: 2,
+
+  // 自动回复频控及信号窗口。
+  autoTalkCooldownMs: 180000,
+  autoTalkHourlyLimit: 3,
+  autoTalkHourlyWindowMs: 3600000,
+  autoSpamWindowMs: 60000,
+  autoSpamRepeatCount: 3,
+  autoTopicRecentMessageCount: 5,
+  autoReplyMaxChars: 40,
+
+  // 以下阈值由冻结的 KNN value-score 模块使用，保持兼容。
   autoChimeScoreThreshold: 0.5,
   vectorConfidenceThreshold: 0.5,
   valueScoreMode: "log", // off / log / block
-  autoTalkIdleMs: 120000,
-  autoTalkActiveWindowMs: 20000,
-  autoTalkActiveMinUsers: 2,
-  autoChimeMinMessages: 3,
-  autoChimeDebounceMs: 1800,
-  autoChimeCheckCooldownMs: 25000,
-  autoChimeForceCooldownMs: 12000,
-  autoChimeMaxPendingAgeMs: 8000,
-  botFollowupWindowMs: 120000,
-  botFollowupMaxPendingAgeMs: 10000,
-  autoTalkCooldownMs: 180000,
-  groupAutoHistoryMaxAgeMs: 180000,
-  groupIdleHistoryMaxAgeMs: 300000,
 };
 
 const CONFIG_PATH = fileURLToPath(import.meta.url);
@@ -98,7 +109,18 @@ let watcherStarted = false;
 let reloadTimer = null;
 let lastObservedStamp = "";
 
-const DECIMAL_CONFIG_KEYS = new Set(["autoChimeScoreThreshold", "vectorConfidenceThreshold"]);
+const DECIMAL_CONFIG_KEYS = new Set([
+  "autoDecisionThreshold",
+  "autoValueScoreWeight",
+  "autoTopicContinuityWeight",
+  "autoWillingnessWeight",
+  "willingnessDecayFactor",
+  "willingnessMessageGain",
+  "willingnessMentionGain",
+  "willingnessStickerMultiplier",
+  "autoChimeScoreThreshold",
+  "vectorConfidenceThreshold",
+]);
 
 const NUMERIC_RANGES = {
   apiRequestsPerMinute: [1, 600],
@@ -119,21 +141,26 @@ const NUMERIC_RANGES = {
   maxGroupHistoryFetchCount: [5, 100],
   maxGroupContextMessages: [1, 100],
   maxGroupContextChars: [500, 30000],
+  autoDecisionThreshold: [0, 1],
+  autoValueScoreWeight: [0, 1],
+  autoTopicContinuityWeight: [0, 1],
+  autoWillingnessWeight: [0, 1],
+  willingnessMax: [0, 20],
+  willingnessDecayIntervalMs: [1000, 300000],
+  willingnessDecayFactor: [0, 1],
+  willingnessMessageGain: [0, 3],
+  willingnessMentionGain: [0, 3],
+  willingnessStickerMultiplier: [0, 1],
+  willingnessReplyPenalty: [0, 20],
+  autoTalkCooldownMs: [10000, 3600000],
+  autoTalkHourlyLimit: [1, 100],
+  autoTalkHourlyWindowMs: [60000, 86400000],
+  autoSpamWindowMs: [1000, 3600000],
+  autoSpamRepeatCount: [2, 100],
+  autoTopicRecentMessageCount: [1, 20],
+  autoReplyMaxChars: [1, 200],
   autoChimeScoreThreshold: [0, 1],
   vectorConfidenceThreshold: [0, 1],
-  autoTalkIdleMs: [10000, 3600000],
-  autoTalkActiveWindowMs: [5000, 300000],
-  autoTalkActiveMinUsers: [2, 50],
-  autoChimeMinMessages: [1, 30],
-  autoChimeDebounceMs: [0, 15000],
-  autoChimeCheckCooldownMs: [0, 600000],
-  autoChimeForceCooldownMs: [0, 600000],
-  autoChimeMaxPendingAgeMs: [500, 60000],
-  botFollowupWindowMs: [10000, 600000],
-  botFollowupMaxPendingAgeMs: [500, 60000],
-  autoTalkCooldownMs: [10000, 3600000],
-  groupAutoHistoryMaxAgeMs: [10000, 3600000],
-  groupIdleHistoryMaxAgeMs: [10000, 3600000],
 };
 
 function normalizeRuntimeConfig(candidate) {

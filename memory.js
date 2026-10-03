@@ -541,6 +541,10 @@ async function embed(text, { isQuery = false } = {}) {
   return embedLocal(text, { isQuery });
 }
 
+export async function embedText(text) {
+  return embed(String(text ?? ""));
+}
+
 function buildStateRow({
   uid,
   key,
