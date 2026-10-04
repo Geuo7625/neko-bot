@@ -128,7 +128,7 @@ export async function sendStickerTool(toolCall, ws, targetId, isGroup) {
 // 主人指令“表情包测试”：一键验证发送链路。
 export async function runStickerSelfTest(ws, targetId, isGroup) {
   if (!RUNTIME_CONFIG.stickerEnabled) return "FAIL：表情包功能已关闭";
-  if (!isGroup && !RUNTIME_CONFIG.stickerPrivateChatEnabled) return "FAIL：私聊发送已关闭";
+  // 主人主动发起的诊断，不受私聊发送开关限制。
   const approved = getApprovedStickersWithEmbeddings();
   if (!approved.length) return "FAIL：还没有已转正的表情包（先发几张 mface 再审核通过）";
   const sticker = approved[approved.length - 1];

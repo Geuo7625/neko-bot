@@ -1826,8 +1826,8 @@ async function handleQqEventInternal(ws, event) {
       const faceId = segData.id ?? "";
       userText += faceId !== "" ? `[QQ表情:${faceId}]` : "[QQ表情]";
     } else if (segType === "mface") {
-      if (isGroup) {
-        void handleMfaceMessage(seg, senderId, groupId, isOwner);
+      if (isGroup || isOwner) {
+        void handleMfaceMessage(seg, senderId, isGroup ? groupId : null, isOwner);
         void maybeFollowMemePattern({ seg, senderId, groupId, selfId, ws });
       }
       userText += `[QQ商城表情:${segData.summary || segData.key || "QQ商城表情"}]`;
@@ -1884,6 +1884,14 @@ async function handleQqEventInternal(ws, event) {
       repliedMessageData?.sender?.uin;
     isReplyToBot = quotedSenderId !== null && quotedSenderId !== undefined &&
       String(quotedSenderId) === String(selfId);
+  }
+
+  // 主人私聊纯发表情包：直接确认收藏，不走 LLM；配了文字的照旧。
+  const pureMface = segments.length > 0 &&
+    segments.every((s) => s && s.type === "mface");
+  if (!isGroup && isOwner && pureMface) {
+    await sendQqMsg(ws, targetId, false, "表情包已收藏✅");
+    return;
   }
 
   // ----- 控制 / 公开指令 -----
