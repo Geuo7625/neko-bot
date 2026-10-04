@@ -4,14 +4,15 @@ import WebSocket from "ws";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
-import { NAPCAT_WS_URL, NAPCAT_HTTP_URL, NAPCAT_TOKEN, RUNTIME_CONFIG, onRuntimeConfigReload } from "./config.js";
+import { NAPCAT_WS_URL, NAPCAT_HTTP_URL, NAPCAT_TOKEN, RUNTIME_CONFIG, DIRECT_TOOLS, onRuntimeConfigReload } from "./config.js";
 import { handleMfaceMessage, approveSticker } from "./sticker-collector.js";
 import { getPendingStickers, deleteSticker } from "./sticker-memory.js";
 import { runStickerSelfTest } from "./sticker-sender.js";
 import { maybeFollowMemePattern } from "./sticker-follow.js";
 
 const OWNER_QQ_ID = String(RUNTIME_CONFIG.ownerQQ || "");
-import { coreProcessChat, clearHistory, clearAllHistories, clearContextRequests, AUTO_SKIP_MARKER } from "./core.js";
+import { coreProcessChat, clearHistory, clearAllHistories, clearContextRequests } from "./core.js";
+import { runAutoReply } from "./auto-reply.js";
 import { embedText } from "./memory.js";
 import {
   clearGroupTopicMemory,
@@ -525,66 +526,7 @@ function getGroupTopicMemoryPrompt(groupId, vector) {
   }
 }
 
-async function generateAutoReply(ws, {
-  groupId, selfId, botName, senderId, messageId, text, score, valueResult, messageVector, clearGeneration,
-}) {
-  const state = getGroupTalkState(groupId);
-  const speechVersion = state.speechVersion;
-  try {
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    const groupContext = await fetchGroupHistory(groupId, messageId, selfId, false);
-    if (getGroupHistoryGeneration(groupId) !== clearGeneration) return;
-    if (state.speechVersion !== speechVersion) return;
-    const memoryPrompt = getGroupTopicMemoryPrompt(groupId, messageVector);
-    const contextPrompt = `${groupContext}\n${memoryPrompt}\n你是群里的普通聊天成员。专业或技术问题、需要严谨知识的问题、与当前话题无关的内容，或回复可能答错、添乱、打断交流时，只输出${AUTO_SKIP_MARKER}。轻松玩笑和日常闲聊可以自然接梗；其他情况下结合当前消息口语化回复，最多40字，不要@任何人。`;
-    const result = await coreProcessChat(
-      `qq_group_${String(groupId)}_auto`,
-      text,
-      undefined,
-      {
-        isOwner: false,
-        isGroup: true,
-        userId: String(senderId),
-        botId: String(selfId),
-        botName,
-        searchText: null,
-        thinkingText: null,
-        contextPrompt,
-        contextKey: `group:${String(groupId)}`,
-        allowTools: Boolean(RUNTIME_CONFIG.stickerEnabled && RUNTIME_CONFIG.stickerAutoSendEnabled),
-        toolAllowlist: ["send_sticker"],
-        autoSkipMarker: true,
-        requestPriority: "auto",
-        isContextCurrent: () => getGroupHistoryGeneration(groupId) === clearGeneration,
-        historyTextEntry: text,
-
-        qqWs: ws,
-        qqTargetId: groupId,
-        qqIsGroup: true,
-      },
-    );
-    if (getGroupHistoryGeneration(groupId) !== clearGeneration) return;
-    if (state.speechVersion !== speechVersion) return;
-    if (result?.type === "skipped") {
-      const triggerText = Array.from(String(text ?? "")).slice(0, 60).join("");
-      console.log(`[群聊自动] skip group=${groupId} score=${score.toFixed(3)} text=${JSON.stringify(triggerText)}`);
-      return;
-    }
-    if (result?.type !== "text" || !String(result.content ?? "").trim()) return;
-    const reply = Array.from(String(result.content).trim())
-      .slice(0, Math.max(1, Number(RUNTIME_CONFIG.autoReplyMaxChars) || 40))
-      .join("");
-    if (!reply || reply.includes(AUTO_SKIP_MARKER)) return;
-    await sendAiTextMessages(ws, groupId, true, reply, [], { trackGroupSpeech: true });
-    recordAutoTalk(state, Date.now());
-    const triggerText = Array.from(String(text ?? "")).slice(0, 60).join("");
-    console.log(`[群聊自动] sent group=${groupId} vector=${Number.isFinite(valueResult?.score) ? valueResult.score.toFixed(3) : "—"} willingness=${state.willingness.toFixed(3)} score=${score.toFixed(3)} text=${JSON.stringify(triggerText)}`);
-  } catch (error) {
-    console.error(`[群聊自动] 失败 group=${groupId}: ${error.message}`);
-  } finally {
-    state.autoReplyInFlight = false;
-  }
-}
+// 自动接话的全流程已迁至 auto-reply.js，bot-qq 只负责触发。
 
 // ===== HTTP =====
 const httpClient = axios.create({ timeout: 5000 });
@@ -1435,7 +1377,7 @@ async function extractImageFromMessage(message) {
 }
 
 // ===== 获取群聊历史 =====
-async function fetchGroupHistory(groupId, currentMessageId = null, selfId = null, includeImageToolHints = false) {
+async function fetchGroupHistory(groupId, currentMessageId = null, selfId = null) {
   if (!NAPCAT_HTTP_URL || !NAPCAT_TOKEN) return "";
   const url = NAPCAT_HTTP_URL.replace(/\/+$/, "") + "/get_group_msg_history";
   try {
@@ -1486,9 +1428,7 @@ async function fetchGroupHistory(groupId, currentMessageId = null, selfId = null
       cleanRaw = annotateStructuredMessageText(cleanRaw);
       const isStructured = /【结构化消息类型：/.test(cleanRaw);
       cleanRaw = cleanRaw.slice(0, isStructured ? 500 : 100);
-      const imageHint = hasImage && includeImageToolHints
-        ? ` [含图片；可按需调用 get_recent_group_image，message_id=${String(m.message_id)}]`
-        : hasImage ? " [含图片]" : "";
+      const imageHint = hasImage ? " [含图片]" : "";
       formattedMsgs.push(
         isSelf
           ? `你（机器人） [QQ:${senderId}]: ${cleanRaw}${imageHint}`
@@ -1505,9 +1445,9 @@ async function fetchGroupHistory(groupId, currentMessageId = null, selfId = null
   }
 }
 
-// 自动接话只有在模型主动调用工具时才下载图片；只允许访问最近 20 条、未被清除的群消息。
-async function fetchRecentGroupImage(groupId, requestedMessageId = null) {
-  if (!NAPCAT_HTTP_URL || !NAPCAT_TOKEN || groupId === null || groupId === undefined) return null;
+// 读取最近群消息（最新在前），供自动接话按需挑选图片；只访问未被清除、非黑名单、非视频的消息。
+async function fetchRecentGroupMessages(groupId, { scanCount = 20, messageId = null } = {}) {
+  if (!NAPCAT_HTTP_URL || !NAPCAT_TOKEN || groupId === null || groupId === undefined) return [];
   const url = NAPCAT_HTTP_URL.replace(/\/+$/, "") + "/get_group_msg_history";
   try {
     const response = await httpClient.post(
@@ -1524,39 +1464,54 @@ async function fetchRecentGroupImage(groupId, requestedMessageId = null) {
     const result = response?.data;
     if (response.status !== 200 ||
         (result?.status !== undefined && result.status !== "ok") ||
-        (result?.retcode ?? 0) !== 0) return null;
+        (result?.retcode ?? 0) !== 0) return [];
 
     const data = result.data;
     const messages = data && typeof data === "object" && !Array.isArray(data)
       ? data.messages || [] : Array.isArray(data) ? data : [];
     const clearTime = getGroupHistoryClearTime(groupId);
-    const candidates = messages
+    return messages
       .filter((item) => {
         if (!item || typeof item !== "object") return false;
         if (clearTime > 0 && Number(item.time || 0) <= clearTime) return false;
         if (isBlacklisted(item.user_id)) return false;
         if (item.group_id !== undefined && String(item.group_id) !== String(groupId)) return false;
-        if (!Array.isArray(item.message) || !item.message.some((seg) => seg?.type === "image")) return false;
-        return requestedMessageId === null || requestedMessageId === undefined ||
-          String(item.message_id) === String(requestedMessageId);
+        if (Array.isArray(item.message) && item.message.some((seg) => ["video", "record"].includes(seg?.type))) return false;
+        return messageId === null || messageId === undefined ||
+          String(item.message_id) === String(messageId);
       })
-      .sort((a, b) => Number(b.time || 0) - Number(a.time || 0));
-    const message = candidates[0];
-    if (!message) return null;
-    const imageContent = await extractImageFromMessage(message);
-    if (!imageContent) return null;
-    const sender = message.sender && typeof message.sender === "object" ? message.sender : {};
-    const text = (await messageSegmentsToTextAsync(message.message || [])).replace(/\[图片\]/g, "").trim();
-    return {
-      imageContent,
-      messageId: String(message.message_id ?? ""),
-      senderName: String(sender.card || sender.nickname || message.user_id || "群友"),
-      text: text.slice(0, 500),
-    };
+      .sort((a, b) => Number(b.time || 0) - Number(a.time || 0))
+      .slice(0, Math.max(1, Number(scanCount) || 20))
+      .map((item) => {
+        const sender = item.sender && typeof item.sender === "object" ? item.sender : {};
+        return {
+          messageId: String(item.message_id ?? ""),
+          senderName: String(sender.card || sender.nickname || item.user_id || "群友"),
+          hasImage: Array.isArray(item.message) && item.message.some((seg) => seg?.type === "image"),
+          message: item,
+        };
+      });
   } catch (error) {
-    console.warn(`[群聊图片工具] 读取近期图片失败：${error.message}`);
-    return null;
+    console.warn(`[群聊图片] 读取近期消息失败：${error.message}`);
+    return [];
   }
+}
+
+// 取最近一条可用群图片（供现有调用方使用）。
+async function fetchRecentGroupImage(groupId, requestedMessageId = null) {
+  const messages = await fetchRecentGroupMessages(groupId, { scanCount: 20, messageId: requestedMessageId });
+  const candidate = messages.find((item) => item.hasImage);
+  if (!candidate) return null;
+  const message = candidate.message;
+  const imageContent = await extractImageFromMessage(message);
+  if (!imageContent) return null;
+  const text = (await messageSegmentsToTextAsync(message.message || [])).replace(/\[图片\]/g, "").trim();
+  return {
+    imageContent,
+    messageId: candidate.messageId,
+    senderName: candidate.senderName,
+    text: text.slice(0, 500),
+  };
 }
 
 // ===== 主动戳戳 =====
@@ -2023,7 +1978,7 @@ async function handleQqEventInternal(ws, event) {
 
   if (decision === "ignore") return;
   if (decision === "auto") {
-    await generateAutoReply(ws, {
+    await runAutoReply(ws, {
       groupId,
       selfId,
       botName,
@@ -2175,6 +2130,8 @@ async function handleQqEventInternal(ws, event) {
       thinkingText: finalPrompt,
       imageSourceUrl,
       contextPrompt,
+      // direct：明确呼叫，开放全部工具（矩阵集中在 config.js）。
+      toolAllowlist: DIRECT_TOOLS,
       historyTextEntry: cleanUserHistoryEntry,
       contextKey: isGroup ? `group:${String(groupId)}` : null,
       isContextCurrent: () => !isGroup || getGroupHistoryGeneration(groupId) === groupContextGeneration,
@@ -2292,7 +2249,14 @@ export {
   extractImageSourceFromMessage,
   fetchGroupHistory,
   fetchRecentGroupImage,
+  fetchRecentGroupMessages,
   isOwnerQQ,
   isBlacklisted,
   isNoRandomTalkGroup,
+  // 供 auto-reply.js 编排自动接话使用。
+  getGroupTalkState,
+  recordAutoTalk,
+  getGroupHistoryGeneration,
+  getGroupTopicMemoryPrompt,
+  sendAiTextMessages,
 };

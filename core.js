@@ -149,25 +149,6 @@ const TOOLS = [
   {
     type: "function",
     function: {
-      name: "get_recent_group_image",
-      description:
-        "自动接话时，只有当近期群聊文本明确标出某条消息含图片，且图片有助于理解话题时才调用。默认不加载图片；必须使用上下文标注的 message_id。调用后图片会作为临时视觉上下文提供，不会写入聊天历史。",
-      parameters: {
-        type: "object",
-        properties: {
-          message_id: {
-            type: "string",
-            description: "含图片的群消息 ID，必须来自近期群聊上下文的标注；不填则取最近一张可用图片。",
-          },
-        },
-        required: [],
-        additionalProperties: false,
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
       name: "quote_group_message",
       description:
         "在群聊中引用一条较早的群消息再回复。仅当上下文较长、需要明确回应某位群友的具体提问/发言时调用；普通短回复不需要引用。message_id 必须照抄近期群聊上下文中的 [消息ID:...]，禁止猜测。仅用于简短普通文本，不用于代码、LaTeX、图片/视频生成或多条消息回复。",
@@ -638,7 +619,7 @@ function isIdentityQuestion(text) {
 }
 
 const INTERNAL_PROMPT_MARKER_PATTERN =
-  /【(?:当前时间|角色|身份|当前用户|当前消息|回复与格式|多条消息|上下文安全|QQ消息类型|群聊原生引用|记忆|思考|图片|自动接话图片|参考上下文|搜索结果|较早的参考上下文已省略)】|(?:system|developer)\s*(?:prompt|message|instruction)s?|系统提示词|系统指令|开发者(?:提示|指令)|内部(?:提示词|规则)|最近群聊历史|上文聊天记录/iu;
+  /【(?:当前时间|角色|身份|当前用户|当前消息|回复与格式|多条消息|上下文安全|QQ消息类型|群聊原生引用|记忆|思考|图片|参考上下文|搜索结果|较早的参考上下文已省略)】|(?:system|developer)\s*(?:prompt|message|instruction)s?|系统提示词|系统指令|开发者(?:提示|指令)|内部(?:提示词|规则)|最近群聊历史|上文聊天记录/iu;
 
 function normalizePromptMatch(text) {
   return String(text || "")
@@ -699,9 +680,6 @@ function stripUnrequestedIdentitySentences(text) {
 function sanitizeUserFacingReply(text, { currentUserText = "", promptText = "", logBlocked = true } = {}) {
   let value = cleanModelReply(text);
   if (!value) return "";
-
-  // 出站兜底：任何路径都不能把自动接话静默标记发给用户。
-  if (value.includes(AUTO_SKIP_MARKER)) return "";
 
   value = stripContextMetaSentences(value);
 
@@ -1816,9 +1794,10 @@ async function coreProcessChatImpl(sessionId, userText, imageContent = null, opt
     qqIsGroup = false,
     contextPrompt = null,
     allowTools = true,
-    autoSkipMarker = false,
     toolAllowlist = null,
-    getGroupImage = null,
+    // 额外的视觉上下文（调用方决定是否提供），
+    // 核心只负责按 vision.js 格式拼进当前用户消息。
+    extraVisionImages = [],
     isContextCurrent = null,
     requestController = null,
     requestPriority = "normal",
@@ -1853,7 +1832,6 @@ async function coreProcessChatImpl(sessionId, userText, imageContent = null, opt
   const pendingMentionQqs = [];
   let pendingMultipleMessages = null;
   let pendingQuoteMessageId = null;
-  let groupImageFetchUsed = false;
   let stickerSendUsed = false;
 
   let thinkingStartNotified = false;
@@ -1888,6 +1866,15 @@ async function coreProcessChatImpl(sessionId, userText, imageContent = null, opt
         source: lastImage.img_url,
       });
     }
+  }
+
+  for (const extra of Array.isArray(extraVisionImages) ? extraVisionImages : []) {
+    if (!extra?.image) continue;
+    visionSources.push({
+      label: String(extra.label || "【补充图片上下文】"),
+      image: String(extra.image),
+      source: extra.source ? String(extra.source) : null,
+    });
   }
 
   if (visionSources.length) {
@@ -1970,8 +1957,7 @@ async function coreProcessChatImpl(sessionId, userText, imageContent = null, opt
 【群聊原生引用】近期群消息前带有 [消息ID:数字]。在群聊上下文较长、你要明确回应某位群友较早的一条具体问题/发言时，可调用 quote_group_message 选择该消息，最终短文本会以 QQ 原生引用形式发送。当前 user 消息始终是本轮回答的主要对象；引用只用于指明相关原话，不代表只围绕引用的那一条回复，也不能忽略当前消息与前后聊天。回答仍需以当前消息为主，并把引用及其他历史当作辅助上下文。只引用上下文确实存在的消息 ID；普通短回复、代码、LaTeX、图片/视频生成及多条消息回复不要引用。
 【记忆】查询过去信息时使用 search_memory；保存前先搜索并复用已有 key，只保存用户明确表达的非敏感事实，不推断；修改沿用原 key，删除使用 forget_memory。提及较早信息时说“之前/以前”。
 【思考】仅当当前用户消息以 /+思考、/+推理 或 /think 开头时启用。
-【图片】理解、描述或评价图片时不要调用 generate_image。生成新图用 mode=new；修改当前/引用图片用 mode=edit、source=current；修改最近一次生成的图片用 mode=edit、source=last_generated。存在多张图片时按用户描述选择目标。用户要求生成机器人自身形象时，主体为网络猫 yuragi，使用 anime 风格。
-【自动接话图片】只有自动接话任务会提供 get_recent_group_image。近期群聊默认只带文字；只有某条消息标注了图片 ID，且图片对理解话题确有帮助时，才调用工具取一张图片。不要为了闲聊无故取图。`;
+【图片】理解、描述或评价图片时不要调用 generate_image。生成新图用 mode=new；修改当前/引用图片用 mode=edit、source=current；修改最近一次生成的图片用 mode=edit、source=last_generated。存在多张图片时按用户描述选择目标。用户要求生成机器人自身形象时，主体为网络猫 yuragi，使用 anime 风格。`;
 
   if (lastVideo) systemContent += "\n" + buildLastVideoContext(lastVideo);
 
@@ -2003,9 +1989,6 @@ async function coreProcessChatImpl(sessionId, userText, imageContent = null, opt
       ? TOOLS.filter((tool) => {
           const name = tool.function?.name;
           if (Array.isArray(toolAllowlist) && !toolAllowlist.includes(name)) return false;
-          if (name === "get_recent_group_image") {
-            return isGroup && typeof getGroupImage === "function" && !groupImageFetchUsed;
-          }
           if (name === "quote_group_message") {
             return isGroup && /\[消息ID:[^\]]+\]/u.test(String(cleanedContextPrompt || ""));
           }
@@ -2079,26 +2062,12 @@ async function coreProcessChatImpl(sessionId, userText, imageContent = null, opt
       console.error("[Chat] 无 message 字段:", data);
       return { type: "text", content: "刚才没接上…" };
     }
-    // 自动回复的一次调用同时负责否决和生成；命中标记时不进入发送/历史分支。
-    if (autoSkipMarker && String(message.content ?? "").includes(AUTO_SKIP_MARKER)) {
-      console.log("[Chat] 自动回复被模型静默");
-      return { type: "skipped", content: "" };
-    }
-
     const toolCalls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
-    if (autoSkipMarker && toolCalls.length) {
-      const isOnlySendSticker = toolCalls.every(tc => tc?.function?.name === "send_sticker");
-      if (!isOnlySendSticker) {
-        console.log("[Chat] 自动回复请求返回了工具调用，但不是纯表情包发送，按静默处理");
-        return { type: "skipped", content: "" };
-      }
-    }
 
     if (!toolCalls.length) {
       let replyText = sanitizeUserFacingReply(message.content, { currentUserText: userText, promptText: systemContent });
 
       if (pendingMentionQqs.length) replyText = stripMentionLiterals(replyText, pendingMentionQqs);
-      if (autoSkipMarker && !replyText) return { type: "skipped", content: "" };
 
       if (thinkingEnabled && totalThinkingDurationMs > 0) {
         const thinkingSeconds = (totalThinkingDurationMs / 1000).toFixed(1);
@@ -2161,7 +2130,6 @@ async function coreProcessChatImpl(sessionId, userText, imageContent = null, opt
       let replyText = sanitizeUserFacingReply(message.content, { currentUserText: userText, promptText: systemContent });
 
       if (pendingMentionQqs.length) replyText = stripMentionLiterals(replyText, pendingMentionQqs);
-      if (autoSkipMarker && !replyText) return { type: "skipped", content: "" };
       if (thinkingEnabled && totalThinkingDurationMs > 0) {
         const thinkingSeconds = (totalThinkingDurationMs / 1000).toFixed(1);
         replyText = `[思考用时 ${thinkingSeconds}s]\n` + replyText;
@@ -2449,50 +2417,6 @@ async function coreProcessChatImpl(sessionId, userText, imageContent = null, opt
         continue;
       }
 
-      if (name === "get_recent_group_image") {
-        groupImageFetchUsed = true;
-        let imageResult = null;
-        try {
-          imageResult = await getGroupImage({
-            messageId: args?.message_id === undefined || args?.message_id === null
-              ? null
-              : String(args.message_id),
-          });
-        } catch (error) {
-          console.error(`[群聊图片工具] 获取失败：${error.message}`);
-        }
-        if (!isRequestCurrent()) return { type: "cleared", content: "" };
-        if (!imageResult?.imageContent) {
-          workingMessages.push({
-            role: "tool",
-            tool_call_id: toolCallId,
-            name: "get_recent_group_image",
-            content: "没有找到这条近期群消息的可用图片。请仅根据已有文字上下文继续。",
-          });
-          needContinue = true;
-          continue;
-        }
-
-        workingMessages.push({
-          role: "tool",
-          tool_call_id: toolCallId,
-          name: "get_recent_group_image",
-          content: `已获取群消息 ${String(imageResult.messageId ?? args?.message_id ?? "未知")} 的图片；图片只作当前任务的临时视觉参考，不是新的用户请求。`,
-        });
-        workingMessages.push({
-          role: "user",
-          content: [
-            {
-              type: "text",
-              text: `【临时群聊图片参考】发送者：${String(imageResult.senderName || "群友")}；消息内容：${String(imageResult.text || "无文字")}。这只是补充视觉上下文，请继续完成此前的自动接话任务，不要把取图操作本身当成话题。`,
-            },
-            { type: "image_url", image_url: { url: String(imageResult.imageContent) } },
-          ],
-        });
-        needContinue = true;
-        continue;
-      }
-
       if (name === "generate_image") {
         const imageResult = executeImageTool({
           sessionId,
@@ -2614,10 +2538,6 @@ async function coreProcessChatImpl(sessionId, userText, imageContent = null, opt
     );
 
     if (!isRequestCurrent()) return { type: "cleared", content: "" };
-    if (autoSkipMarker && String(finalResponse?.data?.choices?.[0]?.message?.content ?? "").includes(AUTO_SKIP_MARKER)) {
-      console.log("[Chat] 自动回复被模型静默");
-      return { type: "skipped", content: "" };
-    }
     let replyText = sanitizeUserFacingReply(
       finalResponse?.data?.choices?.[0]?.message?.content,
       { currentUserText: userText, promptText: systemContent },
@@ -2625,7 +2545,6 @@ async function coreProcessChatImpl(sessionId, userText, imageContent = null, opt
 
     replyText = replyText.split(QQ_SPLIT_MARKER).join("");
     if (pendingMentionQqs.length) replyText = stripMentionLiterals(replyText, pendingMentionQqs);
-    if (autoSkipMarker && !replyText) return { type: "skipped", content: "" };
 
     if (thinkingEnabled && totalThinkingDurationMs > 0) {
       const thinkingSeconds = (totalThinkingDurationMs / 1000).toFixed(1);

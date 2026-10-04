@@ -115,6 +115,10 @@ export const RUNTIME_CONFIG = {
   autoFollowUpWindowMs: 90000, // 配成 0 时关闭
   autoFollowUpBonus: 0.08,
 
+  // 自动接话 prompt 带图：回看最近 N 条群消息，最多附带 M 张（省 token）。
+  autoImageScanMessageCount: 5,
+  autoMaxPromptImages: 3,
+
   // 表情包系统
   stickerEnabled: true,
   stickerCollectEnabled: true,
@@ -232,6 +236,8 @@ const NUMERIC_RANGES = {
   autoReplyMaxChars: [1, 200],
   autoFollowUpWindowMs: [0, 600000],
   autoFollowUpBonus: [0, 0.5],
+  autoImageScanMessageCount: [1, 20],
+  autoMaxPromptImages: [0, 10],
   autoChimeScoreThreshold: [0, 1],
   vectorConfidenceThreshold: [0, 1],
   stickerTotalCap: [1, 10000],
@@ -307,6 +313,26 @@ export function startConfigHotReload() {
     }, 180);
   });
 }
+
+// ============================================================
+// 工具权限矩阵（集中定义，调用处只引用常量，避免散装漏配）
+// ============================================================
+// direct：被 @ / 引用机器人 / 私聊等明确呼叫，开放全部工具。
+export const DIRECT_TOOLS = [
+  "save_memory",
+  "search_memory",
+  "forget_memory",
+  "web_search",
+  "send_multiple_messages",
+  "quote_group_message",
+  "send_sticker",
+  "mention_user",
+  "poke_user",
+  "generate_image",
+  "generate_video",
+];
+// auto：自动接话永远不暴露画图/视频等重工具，只允许发表情包。
+export const AUTO_TOOLS = ["send_sticker"];
 
 // ============================================================
 // 主人
