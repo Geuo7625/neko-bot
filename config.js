@@ -111,6 +111,22 @@ export const RUNTIME_CONFIG = {
   autoTopicRecentMessageCount: 5,
   autoReplyMaxChars: 40,
 
+  // 表情包系统
+  stickerEnabled: true,
+  stickerCollectEnabled: true,
+  stickerSendEnabled: true,
+  stickerAutoSendEnabled: true,
+  stickerDescriptionEnabled: true,
+  stickerTotalCap: 1000,
+  stickerMinCollectedUsers: 2,
+  stickerRandomCollectRatio: 0.1,
+  stickerUnpopularRetentionDays: 30,
+  stickerSendCooldownMs: 3600000, // 1 hour
+  stickerHourlyLimitPerGroup: 5,
+  stickerPrivateChatEnabled: false,
+  stickerMinSimilarity: 0.7,
+  stickerFailedRetryAfterMs: 86400000, // 24 hours
+
   // 以下阈值由冻结的 KNN value-score 模块使用，保持兼容。
   autoChimeScoreThreshold: 0.5,
   vectorConfidenceThreshold: 0.5,
@@ -138,7 +154,19 @@ const DECIMAL_CONFIG_KEYS = new Set([
   "willingnessStickerMultiplier",
   "autoChimeScoreThreshold",
   "vectorConfidenceThreshold",
+  "stickerRandomCollectRatio",
+  "stickerMinSimilarity",
 ]);
+
+const BOOLEAN_CONFIG_KEYS = [
+  "topicMemoryEnabled",
+  "stickerEnabled",
+  "stickerCollectEnabled",
+  "stickerSendEnabled",
+  "stickerAutoSendEnabled",
+  "stickerDescriptionEnabled",
+  "stickerPrivateChatEnabled",
+];
 
 const NUMERIC_RANGES = {
   apiRequestsPerMinute: [1, 600],
@@ -190,13 +218,21 @@ const NUMERIC_RANGES = {
   autoReplyMaxChars: [1, 200],
   autoChimeScoreThreshold: [0, 1],
   vectorConfidenceThreshold: [0, 1],
+  stickerTotalCap: [1, 10000],
+  stickerMinCollectedUsers: [1, 10],
+  stickerRandomCollectRatio: [0, 1],
+  stickerUnpopularRetentionDays: [1, 365],
+  stickerSendCooldownMs: [0, 86400000],
+  stickerHourlyLimitPerGroup: [1, 100],
+  stickerMinSimilarity: [0, 1],
+  stickerFailedRetryAfterMs: [0, 2592000000],
 };
 
 function normalizeRuntimeConfig(candidate) {
   const next = { ...RUNTIME_CONFIG };
   if (!candidate || typeof candidate !== "object") return next;
-  if (typeof candidate.topicMemoryEnabled === "boolean") {
-    next.topicMemoryEnabled = candidate.topicMemoryEnabled;
+  for (const key of BOOLEAN_CONFIG_KEYS) {
+    if (typeof candidate[key] === "boolean") next[key] = candidate[key];
   }
   for (const [key, range] of Object.entries(NUMERIC_RANGES)) {
     if (!(key in candidate)) continue;

@@ -5,6 +5,11 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import { NAPCAT_WS_URL, NAPCAT_HTTP_URL, NAPCAT_TOKEN, RUNTIME_CONFIG, onRuntimeConfigReload } from "./config.js";
+import { handleMfaceMessage, approveSticker } from "./sticker-collector.js";
+import { getPendingStickers, deleteSticker } from "./sticker-memory.js";
+import { runStickerSelfTest } from "./sticker-sender.js";
+
+const OWNER_QQ_ID = String(RUNTIME_CONFIG.ownerQQ || "");
 import { coreProcessChat, clearHistory, clearAllHistories, clearContextRequests, AUTO_SKIP_MARKER } from "./core.js";
 import { embedText } from "./memory.js";
 import {
@@ -553,11 +558,16 @@ async function generateAutoReply(ws, {
         thinkingText: null,
         contextPrompt,
         contextKey: `group:${String(groupId)}`,
-        allowTools: false,
+        allowTools: Boolean(RUNTIME_CONFIG.stickerEnabled && RUNTIME_CONFIG.stickerAutoSendEnabled),
+        toolAllowlist: ["send_sticker"],
         autoSkipMarker: true,
         requestPriority: "auto",
         isContextCurrent: () => getGroupHistoryGeneration(groupId) === clearGeneration,
         historyTextEntry: text,
+
+        qqWs: ws,
+        qqTargetId: groupId,
+        qqIsGroup: true,
       },
     );
     if (getGroupHistoryGeneration(groupId) !== clearGeneration) return;
@@ -754,7 +764,23 @@ function getGroupHistoryClearTime(groupId) {
   return Math.max(globalTime, localTime);
 }
 
-function handleBotControlCommand({ command, sessionId, groupId, isGroup, messageTime }) {
+function resolvePendingSticker(arg) {
+  const pending = getPendingStickers(50);
+  if (!pending.length) return { error: "没有待审核的表情包" };
+  const token = String(arg || "").trim().toLowerCase();
+  if (!token) return { error: "请带上序号或 hash 前缀，例如：表情包通过 1" };
+  if (/^\d+$/.test(token)) {
+    const index = Number(token);
+    if (index < 1 || index > pending.length) return { error: `序号超出范围（1-${pending.length}）` };
+    return { sticker: pending[index - 1] };
+  }
+  const matches = pending.filter((item) => item.hash.startsWith(token));
+  if (!matches.length) return { error: "没找到匹配的待审核表情包" };
+  if (matches.length > 1) return { error: "hash 前缀匹配到多个，请写长一点" };
+  return { sticker: matches[0] };
+}
+
+async function handleBotControlCommand({ command, sessionId, groupId, isGroup, messageTime, ws, targetId }) {
   if (!command) return null;
 
   if (command.action === "clear") {
@@ -780,6 +806,37 @@ function handleBotControlCommand({ command, sessionId, groupId, isGroup, message
     setTimeout(() => { console.log("[控制] 主重启，进程退出"); process.exit(0); }, 1000);
     return "…";
   }
+
+  if (command.action === "sticker_test") {
+    if (!ws) return "FAIL：当前没有可用的 NapCat 连接";
+    return await runStickerSelfTest(ws, targetId, isGroup);
+  }
+
+  if (command.action === "sticker_review") {
+    const pending = getPendingStickers(10);
+    if (!pending.length) return "没有待审核的表情包";
+    const lines = pending.map((item, index) =>
+      `${index + 1}. ${item.hash.slice(0, 8)} 出现${item.sender_count}人${item.summary ? ` ${item.summary}` : ""}`);
+    return `待审核表情包：\n${lines.join("\n")}\n回复“表情包通过 序号”转正，“表情包淘汰 序号”删除`;
+  }
+
+  if (command.action === "sticker_approve") {
+    const found = resolvePendingSticker(command.arg);
+    if (found.error) return found.error;
+    const result = await approveSticker(found.sticker.hash);
+    return result.ok
+      ? `已转正表情包 ${found.sticker.hash.slice(0, 8)}：${result.description}`
+      : `转正失败：${result.reason}`;
+  }
+
+  if (command.action === "sticker_reject") {
+    const found = resolvePendingSticker(command.arg);
+    if (found.error) return found.error;
+    return deleteSticker(found.sticker.hash)
+      ? `已淘汰表情包 ${found.sticker.hash.slice(0, 8)}`
+      : "淘汰失败";
+  }
+
   return null;
 }
 
@@ -810,6 +867,30 @@ async function sendQqMsg(ws, targetId, isGroup, text = null, imgUrl = null, imag
   if (messageChain.length === 0) return;
 
   params.message = messageChain;
+
+  if (NAPCAT_HTTP_URL && NAPCAT_TOKEN) {
+    const result = await callNapCatHttp(action, params);
+    if (result) {
+      if (isGroup) noteGroupBotSpeech(targetId);
+      return true;
+    }
+  }
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    throw new Error("NapCat WebSocket 当前未连接");
+  }
+  ws.send(JSON.stringify({ action, params }));
+  if (isGroup) noteGroupBotSpeech(targetId);
+  return true;
+}
+
+// 表情包原样发送：segments 必须是入库时保存的原始 mface 消息段，不重新拼格式。
+async function sendQqSticker(ws, targetId, isGroup, segments) {
+  const message = (Array.isArray(segments) ? segments : []).filter(
+    (seg) => seg && typeof seg === "object" && seg.type,
+  );
+  if (!message.length) throw new Error("表情包消息段为空");
+  const action = isGroup ? "send_group_msg" : "send_private_msg";
+  const params = { [isGroup ? "group_id" : "user_id"]: targetId, message };
 
   if (NAPCAT_HTTP_URL && NAPCAT_TOKEN) {
     const result = await callNapCatHttp(action, params);
@@ -1744,6 +1825,9 @@ async function handleQqEventInternal(ws, event) {
       const faceId = segData.id ?? "";
       userText += faceId !== "" ? `[QQ表情:${faceId}]` : "[QQ表情]";
     } else if (segType === "mface") {
+      if (isGroup) {
+        void handleMfaceMessage(seg, senderId, groupId, isOwner);
+      }
       userText += `[QQ商城表情:${segData.summary || segData.key || "QQ商城表情"}]`;
     } else if (segType === "dice") {
       userText += `[骰子:${segData.result ?? "未知"}]`;
@@ -1804,8 +1888,8 @@ async function handleQqEventInternal(ws, event) {
   const controlCommand = handleControlCommand(userText, senderId);
 
   if (controlCommand?.type === "owner") {
-    const controlReply = handleBotControlCommand({
-      command: controlCommand, sessionId, groupId, isGroup, messageTime,
+    const controlReply = await handleBotControlCommand({
+      command: controlCommand, sessionId, groupId, isGroup, messageTime, ws, targetId,
     });
     if (controlReply) await sendQqMsg(ws, targetId, isGroup, controlReply);
     return;
@@ -2083,6 +2167,10 @@ async function handleQqEventInternal(ws, event) {
       contextKey: isGroup ? `group:${String(groupId)}` : null,
       isContextCurrent: () => !isGroup || getGroupHistoryGeneration(groupId) === groupContextGeneration,
 
+      qqWs: ws, // Pass ws object
+      qqTargetId: targetId, // Pass targetId
+      qqIsGroup: isGroup, // Pass isGroup
+
       // 思维链不再额外发 “让我想想…”；有思考就让 SSE 走完直接发最终回复。
       onThinkingStart: async () => {
         console.log(`[QQ] 开始思考 session=${sessionId}`);
@@ -2178,6 +2266,7 @@ function sleep(ms) {
 export {
   handleQqWs,
   sendQqMsg,
+  sendQqSticker,
   sendQqVideo,
   sendQqPoke,
   sendQqMention,

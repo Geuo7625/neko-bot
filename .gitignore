@@ -3,6 +3,7 @@ node_modules/
 bot-config.json
 latex-wasm/
 memory_db/
+stickers/
 assets/
 .cache/
 .gitignore

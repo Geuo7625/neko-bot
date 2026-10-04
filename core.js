@@ -14,6 +14,7 @@ import { createVisionMessage } from "./vision.js";
 import { generateImage } from "./image.js";
 import { createVideoTask, waitForVideo } from "./video.js";
 import { exaSearch } from "./exa.js";
+import { sendStickerTool } from "./sticker-sender.js";
 import {
   SAVE_MEMORY_TOOL,
   SEARCH_MEMORY_TOOL,
@@ -176,6 +177,22 @@ const TOOLS = [
           message_id: { type: "string", description: "上下文里对应原消息的消息 ID。" },
         },
         required: ["message_id"],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "send_sticker",
+      description:
+        "当判断当前聊天适合用表情包回应时调用。你只负责判断‘配不配发表情包’并给出一句意图，具体发哪张由向量检索决定。",
+      parameters: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "当前语境暗示的表情包含义或情绪，尽可能具体。" },
+        },
+        required: ["query"],
         additionalProperties: false,
       },
     },
@@ -1794,6 +1811,9 @@ async function coreProcessChatImpl(sessionId, userText, imageContent = null, opt
     onVideoReady = null,
     onVideoError = null,
     onPokeUser = null,
+    qqWs = null,
+    qqTargetId = null,
+    qqIsGroup = false,
     contextPrompt = null,
     allowTools = true,
     autoSkipMarker = false,
@@ -1834,6 +1854,7 @@ async function coreProcessChatImpl(sessionId, userText, imageContent = null, opt
   let pendingMultipleMessages = null;
   let pendingQuoteMessageId = null;
   let groupImageFetchUsed = false;
+  let stickerSendUsed = false;
 
   let thinkingStartNotified = false;
   const notifyThinkingStart = async () => {
@@ -1994,6 +2015,9 @@ async function coreProcessChatImpl(sessionId, userText, imageContent = null, opt
           if (name === "search_memory")
             return Boolean(userId) && memorySearchCount < MAX_MEMORY_SEARCHES_PER_REQUEST;
           if (name === "forget_memory") return Boolean(userId);
+          if (name === "send_sticker") {
+            return !stickerSendUsed && Boolean(RUNTIME_CONFIG.stickerEnabled && RUNTIME_CONFIG.stickerSendEnabled);
+          }
           return true;
         })
       : [];
@@ -2063,8 +2087,11 @@ async function coreProcessChatImpl(sessionId, userText, imageContent = null, opt
 
     const toolCalls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
     if (autoSkipMarker && toolCalls.length) {
-      console.log("[Chat] 自动回复请求返回了工具调用，按静默处理");
-      return { type: "skipped", content: "" };
+      const isOnlySendSticker = toolCalls.every(tc => tc?.function?.name === "send_sticker");
+      if (!isOnlySendSticker) {
+        console.log("[Chat] 自动回复请求返回了工具调用，但不是纯表情包发送，按静默处理");
+        return { type: "skipped", content: "" };
+      }
     }
 
     if (!toolCalls.length) {
@@ -2505,6 +2532,25 @@ async function coreProcessChatImpl(sessionId, userText, imageContent = null, opt
         return videoResult && typeof videoResult === "object"
           ? { ...videoResult, mentionQqs: [...pendingMentionQqs] }
           : videoResult;
+      }
+
+      if (name === "send_sticker") {
+        // 目标以当前会话为准，避免模型猜测 target_id/is_group。
+        const result = await sendStickerTool(
+          toolCall,
+          qqWs,
+          qqTargetId ?? args.target_id,
+          qqIsGroup ?? args.is_group,
+        );
+        stickerSendUsed = true;
+        workingMessages.push({
+          role: "tool",
+          tool_call_id: toolCallId,
+          name: "send_sticker",
+          content: result.result,
+        });
+        needContinue = true;
+        continue;
       }
 
       console.warn(`[Tool] 未知工具: ${name}`);

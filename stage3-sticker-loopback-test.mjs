@@ -7,7 +7,7 @@ if (!connectionUrl.hostname || connectionUrl.hostname === "undefined") {
 } else {
   const socket = new WebSocket(connectionUrl);
   const timeout = setTimeout(() => {
-    console.error("[表情链路测试] FAIL: 等待群 face/mface 事件超时");
+    console.error("[表情链路测试] FAIL: 等待群 mface 事件超时");
     socket.close();
     process.exitCode = 1;
   }, 90_000);
@@ -15,7 +15,7 @@ if (!connectionUrl.hostname || connectionUrl.hostname === "undefined") {
   let echoId = null;
 
   socket.addEventListener("open", () => {
-    console.log("[表情链路测试] 已连接，请在群里发送一张 face/mface 表情");
+    console.log("[表情链路测试] 已连接，请在群里发送一张 mface 商城表情");
   });
 
   socket.addEventListener("message", (event) => {
@@ -37,7 +37,7 @@ if (!connectionUrl.hostname || connectionUrl.hostname === "undefined") {
     if (payload?.post_type !== "message" || payload?.message_type !== "group" || !Array.isArray(message)) return;
     if (String(payload.user_id) === String(payload.self_id)) return;
     const storedSegments = message
-      .filter((segment) => segment?.type === "face" || segment?.type === "mface")
+      .filter((segment) => segment?.type === "mface")
       .map((segment) => JSON.parse(JSON.stringify(segment)));
     if (!storedSegments.length) return;
 

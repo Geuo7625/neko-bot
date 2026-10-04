@@ -8,7 +8,15 @@ const OWNER_ONLY_COMMANDS = new Map([
   ["/clear", "clear"],
   ["/rm -rf /*", "clear_all"],
   ["/reboot", "reboot"],
+  ["表情包测试", "sticker_test"],
+  ["表情包审核", "sticker_review"],
 ]);
+
+// 带参数的主人指令：指令名 + 空格 + 参数（表情包序号 / hash 前缀）。
+const OWNER_PREFIX_COMMANDS = [
+  ["表情包通过", "sticker_approve"],
+  ["表情包淘汰", "sticker_reject"],
+];
 
 // ============================================================
 // 公开指令
@@ -22,35 +30,53 @@ const PUBLIC_COMMANDS = new Map([["/状态", "server_status"]]);
 // 指令解析
 // ============================================================
 
+function isOwnerQq(senderQq) {
+  return Boolean(senderQq) && String(senderQq).trim() === String(OWNER_QQ).trim();
+}
+
 function handleControlCommand(text, senderQq) {
   if (!text || typeof text !== "string") {
     return null;
   }
 
-  const command = text.trim().toLowerCase();
+  const command = text.trim();
+  const lowered = command.toLowerCase();
+
+  // ==========================================================
+  // 主人专用（带参数）
+  // ==========================================================
+
+  for (const [prefix, action] of OWNER_PREFIX_COMMANDS) {
+    if (lowered.startsWith(prefix)) {
+      const arg = command.slice(prefix.length).trim();
+      return {
+        type: isOwnerQq(senderQq) ? "owner" : "unauthorized",
+        action,
+        arg,
+        command: lowered,
+      };
+    }
+  }
 
   // ==========================================================
   // 主人专用
   // ==========================================================
 
-  const ownerAction = OWNER_ONLY_COMMANDS.get(command);
+  const ownerAction = OWNER_ONLY_COMMANDS.get(lowered);
 
   if (ownerAction) {
-    const isOwner =
-      senderQq && String(senderQq).trim() === String(OWNER_QQ).trim();
-
-    if (isOwner) {
+    if (isOwnerQq(senderQq)) {
       return {
         type: "owner",
         action: ownerAction,
-        command,
+        command: lowered,
       };
     }
 
     return {
       type: "unauthorized",
       action: ownerAction,
-      command,
+      command: lowered,
     };
   }
 
@@ -58,7 +84,7 @@ function handleControlCommand(text, senderQq) {
   // 公开
   // ==========================================================
 
-  const publicAction = PUBLIC_COMMANDS.get(command);
+  const publicAction = PUBLIC_COMMANDS.get(lowered);
 
   if (publicAction) {
     return {
