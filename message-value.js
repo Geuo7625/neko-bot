@@ -75,17 +75,23 @@ export function shouldEvaluateMessage(input) {
   return { eligible: true, reason: null, text };
 }
 
-export function scoreContent(input, { direct = false, botName = "" } = {}) {
+// 是否为疑问类消息：疑问词 / “吗呢”结尾 / 问号；用于内容打分与追问窗口判定。
+export function looksLikeQuestion(input) {
   const text = cleanValueText(input);
   const chars = Array.from(text).length;
-  let score = 0;
-
   // 常见疑问词直接表明有问题；“什么”排除无实际提问的固定口语。
   const hasQuestionWord = /怎么|如何|为什么|有没有/u.test(text) ||
     (/什么/u.test(text) && !/(?:没什么|这什么|那什么)/u.test(text));
   const endsWithQuestionParticle = chars >= 4 && chars <= 80 && /(?:吗|呢)[？?!！。…~～]*$/u.test(text);
   const hasQuestionMark = chars >= 4 && chars <= 120 && /[？?]/u.test(text);
-  if (hasQuestionWord || endsWithQuestionParticle || hasQuestionMark) score += 0.15;
+  return hasQuestionWord || endsWithQuestionParticle || hasQuestionMark;
+}
+
+export function scoreContent(input, { direct = false, botName = "" } = {}) {
+  const text = cleanValueText(input);
+  let score = 0;
+
+  if (looksLikeQuestion(text)) score += 0.15;
 
   const explicitHelp = /帮我|帮忙|请问|可以吗|要不要/u.test(text) ||
     (direct ? /能不能/u.test(text) : /^能不能/u.test(text));
@@ -133,7 +139,11 @@ export function decide(message, context = {}) {
   const presencePenalty = botRatio <= softRatio || maxRatio <= softRatio
     ? 0
     : Math.min(maxPenalty, Math.max(0, (botRatio - softRatio) / (maxRatio - softRatio)) * maxPenalty);
-  const score = Math.max(0, Math.min(1, weightedScore - presencePenalty));
+  const configuredFollowUpBonus = Number(RUNTIME_CONFIG.autoFollowUpBonus);
+  const followUpBonus = context.isFollowUp
+    ? (Number.isFinite(configuredFollowUpBonus) ? Math.max(0, configuredFollowUpBonus) : 0.08)
+    : 0;
+  const score = Math.max(0, Math.min(1, weightedScore - presencePenalty + followUpBonus));
   context.score = score;
   context.presencePenalty = presencePenalty;
   // 过阈值后原子占位，防止并发消息重复启动 auto 生成。

@@ -111,6 +111,10 @@ export const RUNTIME_CONFIG = {
   autoTopicRecentMessageCount: 5,
   autoReplyMaxChars: 40,
 
+  // 自动回复追问窗口：bot 刚发完言 N 秒内的问题类消息跳过 3 分钟发言冷却。
+  autoFollowUpWindowMs: 90000, // 配成 0 时关闭
+  autoFollowUpBonus: 0.08,
+
   // 表情包系统
   stickerEnabled: true,
   stickerCollectEnabled: true,
@@ -163,6 +167,7 @@ const DECIMAL_CONFIG_KEYS = new Set([
   "vectorConfidenceThreshold",
   "stickerRandomCollectRatio",
   "stickerMinSimilarity",
+  "autoFollowUpBonus",
 ]);
 
 const BOOLEAN_CONFIG_KEYS = [
@@ -225,6 +230,8 @@ const NUMERIC_RANGES = {
   autoSpamRepeatCount: [2, 100],
   autoTopicRecentMessageCount: [1, 20],
   autoReplyMaxChars: [1, 200],
+  autoFollowUpWindowMs: [0, 600000],
+  autoFollowUpBonus: [0, 0.5],
   autoChimeScoreThreshold: [0, 1],
   vectorConfidenceThreshold: [0, 1],
   stickerTotalCap: [1, 10000],

@@ -28,9 +28,11 @@ import {
   decide,
   isHardVetoMessage,
   isTechnicalQuestion,
+  looksLikeQuestion,
   scoreContent,
   shouldEvaluateMessage,
 } from "./message-value.js";
+import { isGroupCoolingDown } from "./auto-reply-cooldown.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -296,16 +298,6 @@ function getGroupTalkState(groupId) {
 
 function recordAutoTalk(state, at = Date.now()) {
   state.autoTalkTimes.push(at);
-}
-
-function isGroupCoolingDown(state, now = Date.now()) {
-  const cooldownMs = Math.max(0, Number(RUNTIME_CONFIG.autoTalkCooldownMs) || 180000);
-  const hourlyWindowMs = Math.max(60000, Number(RUNTIME_CONFIG.autoTalkHourlyWindowMs) || 3600000);
-  const hourlyLimit = Math.max(1, Number(RUNTIME_CONFIG.autoTalkHourlyLimit) || 3);
-  state.autoTalkTimes = state.autoTalkTimes.filter((at) => now - at < hourlyWindowMs);
-  return state.autoReplyInFlight ||
-    now - state.lastAutoTalkAt < cooldownMs ||
-    state.autoTalkTimes.length >= hourlyLimit;
 }
 
 function decayWillingness(state, now = Date.now()) {
@@ -1970,7 +1962,16 @@ async function handleQqEventInternal(ws, event) {
   let topicContinuity = 0;
   let valueResult = null;
   const now = Date.now();
-  const coolingDown = Boolean(groupState && !direct && isGroupCoolingDown(groupState, now));
+  // 追问窗口：bot 刚发完言 N 秒内的问题类消息跳过“距上次发言”冷却，把话说完。
+  const configuredFollowUpWindow = Number(RUNTIME_CONFIG.autoFollowUpWindowMs);
+  const followUpWindowMs = Number.isFinite(configuredFollowUpWindow)
+    ? Math.max(0, configuredFollowUpWindow)
+    : 90000;
+  const isFollowUp = Boolean(!direct && groupState && groupState.lastAutoTalkAt > 0 &&
+    (now - groupState.lastAutoTalkAt) < followUpWindowMs &&
+    looksLikeQuestion(scoreText));
+  const coolingDown = Boolean(groupState && !direct &&
+    isGroupCoolingDown(groupState, now, { ignoreRecentTalk: isFollowUp }));
 
   if (isGroup && !hardVeto && !filteredMessage && scoreText) {
     try {
@@ -1987,6 +1988,7 @@ async function handleQqEventInternal(ws, event) {
     direct,
     hardVeto: hardVeto || Boolean(valueResult?.blocked),
     coolingDown,
+    isFollowUp,
     valueScore: Number.isFinite(valueResult?.score) ? valueResult.score : 0,
     valueAbstain: Boolean(valueResult?.lowConfidence),
     topicContinuity,
@@ -1997,7 +1999,7 @@ async function handleQqEventInternal(ws, event) {
     recentSpeech: groupState?.recentSpeech,
     claimAuto: groupState
       ? () => {
-          if (isGroupCoolingDown(groupState)) return false;
+          if (isGroupCoolingDown(groupState, Date.now(), { ignoreRecentTalk: isFollowUp })) return false;
           groupState.autoReplyInFlight = true;
           return true;
         }
@@ -2016,7 +2018,7 @@ async function handleQqEventInternal(ws, event) {
               : isNoRandomTalkGroup(groupId) ? "group-disabled"
                 : filteredMessage ? "filtered"
                   : valueResult?.blocked ? "knn-block" : "pass";
-    console.log(`[群消息价值] group=${groupId} mode=${RUNTIME_CONFIG.valueScoreMode} vector=${vectorValue} content=${Number(decisionContext.contentScore || 0).toFixed(3)} rule=${ruleValue} top=${topValue} willingness=${decisionContext.willingness.toFixed(3)} topic=${topicContinuity.toFixed(3)} presence=${Number(decisionContext.presencePenalty || 0).toFixed(3)} score=${Number(decisionContext.score || 0).toFixed(3)} decision=${decision}`);
+    console.log(`[群消息价值] group=${groupId} mode=${RUNTIME_CONFIG.valueScoreMode} vector=${vectorValue} content=${Number(decisionContext.contentScore || 0).toFixed(3)} rule=${ruleValue} top=${topValue} willingness=${decisionContext.willingness.toFixed(3)} topic=${topicContinuity.toFixed(3)} presence=${Number(decisionContext.presencePenalty || 0).toFixed(3)} followUp=${isFollowUp ? 1 : 0} score=${Number(decisionContext.score || 0).toFixed(3)} decision=${decision}`);
   }
 
   if (decision === "ignore") return;
