@@ -7,10 +7,10 @@
 // ============================================================
 import fs from "node:fs";
 import path from "node:path";
-import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 import axios from "axios";
 import { RUNTIME_CONFIG } from "./config.js";
+import { sha256, hashFromMfaceData } from "./sticker-hash.js";
 import {
   STICKER_STATUS,
   upsertStickerSighting,
@@ -24,21 +24,6 @@ import { embedText } from "./memory.js";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const STICKERS_DIR = path.join(__dirname, "stickers");
 const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
-
-function sha256(buffer) {
-  return crypto.createHash("sha256").update(buffer).digest("hex");
-}
-
-function hashFromMfaceData(data) {
-  const key = [
-    data?.emoji_package_id,
-    data?.emoji_id,
-    data?.key,
-    data?.summary,
-  ].filter((value) => value !== undefined && value !== null && value !== "").join("|");
-  const basis = key || JSON.stringify(data || {});
-  return sha256(Buffer.from(String(basis), "utf8"));
-}
 
 function guessExtension(contentType, source) {
   const type = String(contentType || "").toLowerCase();

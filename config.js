@@ -127,6 +127,13 @@ export const RUNTIME_CONFIG = {
   stickerMinSimilarity: 0.7,
   stickerFailedRetryAfterMs: 86400000, // 24 hours
 
+  // 表情包跟队形：同群同图短时间被多人发出时，bot 原样跟一张。
+  stickerFollowEnabled: true,
+  stickerFollowThreshold: 3,        // 窗口内同一指纹出现次数门槛
+  stickerFollowWindowSeconds: 30,   // 统计时间窗
+  stickerFollowDistinctUsers: true, // 是否要求至少 2 个不同发送者
+  stickerFollowCooldownMs: 600000,  // 每群跟队形冷却（默认 10 分钟）
+
   // 以下阈值由冻结的 KNN value-score 模块使用，保持兼容。
   autoChimeScoreThreshold: 0.5,
   vectorConfidenceThreshold: 0.5,
@@ -166,6 +173,8 @@ const BOOLEAN_CONFIG_KEYS = [
   "stickerAutoSendEnabled",
   "stickerDescriptionEnabled",
   "stickerPrivateChatEnabled",
+  "stickerFollowEnabled",
+  "stickerFollowDistinctUsers",
 ];
 
 const NUMERIC_RANGES = {
@@ -226,6 +235,9 @@ const NUMERIC_RANGES = {
   stickerHourlyLimitPerGroup: [1, 100],
   stickerMinSimilarity: [0, 1],
   stickerFailedRetryAfterMs: [0, 2592000000],
+  stickerFollowThreshold: [2, 100],
+  stickerFollowWindowSeconds: [1, 3600],
+  stickerFollowCooldownMs: [0, 86400000],
 };
 
 function normalizeRuntimeConfig(candidate) {

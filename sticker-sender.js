@@ -6,29 +6,7 @@ import { getApprovedStickersWithEmbeddings, updateSticker } from "./sticker-memo
 import { embedText } from "./memory.js";
 import { sendQqSticker } from "./bot-qq.js";
 import { RUNTIME_CONFIG } from "./config.js";
-
-const HOUR_MS = 3600000;
-
-// 每群表情包发送计数（独立于文本回复频控）。
-const groupStickerSendCounts = new Map();
-
-function checkGroupStickerLimit(groupId) {
-  const limit = Math.max(1, Number(RUNTIME_CONFIG.stickerHourlyLimitPerGroup) || 5);
-  const now = Date.now();
-  const hourBucket = Math.floor(now / HOUR_MS);
-  let buckets = groupStickerSendCounts.get(groupId);
-  if (!buckets) {
-    buckets = new Map();
-    groupStickerSendCounts.set(groupId, buckets);
-  }
-  const count = buckets.get(hourBucket) || 0;
-  if (count >= limit) return false;
-  buckets.set(hourBucket, count + 1);
-  for (const bucket of buckets.keys()) {
-    if (bucket < hourBucket - 1) buckets.delete(bucket);
-  }
-  return true;
-}
+import { checkGroupStickerLimit } from "./sticker-limit.js";
 
 function cosineSimilarity(vec1, vec2) {
   if (!vec1 || !vec2 || vec1.length !== vec2.length) return 0;

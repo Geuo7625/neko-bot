@@ -8,6 +8,7 @@ import { NAPCAT_WS_URL, NAPCAT_HTTP_URL, NAPCAT_TOKEN, RUNTIME_CONFIG, onRuntime
 import { handleMfaceMessage, approveSticker } from "./sticker-collector.js";
 import { getPendingStickers, deleteSticker } from "./sticker-memory.js";
 import { runStickerSelfTest } from "./sticker-sender.js";
+import { maybeFollowMemePattern } from "./sticker-follow.js";
 
 const OWNER_QQ_ID = String(RUNTIME_CONFIG.ownerQQ || "");
 import { coreProcessChat, clearHistory, clearAllHistories, clearContextRequests, AUTO_SKIP_MARKER } from "./core.js";
@@ -1827,6 +1828,7 @@ async function handleQqEventInternal(ws, event) {
     } else if (segType === "mface") {
       if (isGroup) {
         void handleMfaceMessage(seg, senderId, groupId, isOwner);
+        void maybeFollowMemePattern({ seg, senderId, groupId, selfId, ws });
       }
       userText += `[QQ商城表情:${segData.summary || segData.key || "QQ商城表情"}]`;
     } else if (segType === "dice") {
